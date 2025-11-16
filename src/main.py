@@ -56,7 +56,7 @@ import torch
 import pathlib
 REPO_ROOT = pathlib.Path(__file__).parent.parent
 # Use stockfish_949.pt from local repository
-MODEL_PATH = str(REPO_ROOT / "stockfish_949_fp16.pt")
+MODEL_PATH = str(REPO_ROOT / "stockfish_949_distilled_stronger.pt")
 # Opening book enabled
 OPENING_BOOK_PATH = str(REPO_ROOT / "opening_book.pkl") if (REPO_ROOT / "opening_book.pkl").exists() else None
 
@@ -91,6 +91,7 @@ OPENING_COMPARE_WITH_MCTS = False  # Enable MCTS comparison between model move a
 OPENING_QUICK_SEARCH = False  # Enable quick MCTS search to find better opening moves (slower but more accurate)
 
 # Time management flags
+INSTANT_MODE_THRESHOLD_MS = 10000  # Instant mode: skip everything, use fastest possible move (10 seconds)
 LOW_TIME_SKIP_MCTS_MS = 8000  # Skip MCTS entirely when time drops below this (8 seconds, tune this)
 CRITICAL_TIME_SKIP_MCTS_MS = 5000  # Force greedy policy when time is critically low (5 seconds)
 LOSING_BADLY_THRESHOLD = -0.8  # Force greedy policy when losing very badly (value < -0.9)
@@ -571,6 +572,118 @@ def test_func(ctx: GameContext):
         move_probs = {move: 1.0}
         ctx.logProbabilities(move_probs)
         return move
+    
+    # INSTANT MODE: When time is critically low (< 10 seconds), make moves instantly
+    # Skip all expensive operations: MCTS, opening book comparisons, etc.
+    # Just use cached NN eval if available, or do a quick NN eval, then pick top move
+    # NOTE: ctx.timeLeft comes from the platform (ChessHacks) via GameContext, not our own timer
+    movetime_ms = ctx.timeLeft if ctx.timeLeft and ctx.timeLeft > 0 else 0
+    if movetime_ms > 0 and movetime_ms < INSTANT_MODE_THRESHOLD_MS:
+        if VERBOSE:
+            print(f"INSTANT MODE: timeLeft={movetime_ms:.0f}ms < {INSTANT_MODE_THRESHOLD_MS}ms - making instant move")
+        
+        # Try to get cached evaluation first (fastest)
+        cached_result = _cached_nn_eval(ctx.board)
+        if cached_result is not None:
+            # Cache hit - use it instantly
+            root_policy_logits, root_value = cached_result
+            from .chess_policy.encoding import legal_mask_4672
+            from .chess_policy.infer import mask_logits, probs_from_logits
+            from .chess_policy.move_index import index_to_move, POLICY_SIZE
+            
+            logits = root_policy_logits.to(device)
+            legal = torch.from_numpy(legal_mask_4672(ctx.board)).to(logits.device)
+            masked = mask_logits(logits, legal)
+            probs = probs_from_logits(masked, temperature=0.0)  # Deterministic
+            
+            idx = int(torch.argmax(probs).item())
+            move = index_to_move(ctx.board, idx) if 0 <= idx < POLICY_SIZE else None
+            
+            if move is None or move not in legal_moves:
+                # Fallback: try sorted moves
+                order = torch.argsort(probs, descending=True).tolist()
+                for i in order:
+                    if 0 <= i < POLICY_SIZE:
+                        mv_try = index_to_move(ctx.board, int(i))
+                        if mv_try is not None and mv_try in legal_moves:
+                            move = mv_try
+                            break
+                if move is None or move not in legal_moves:
+                    move = legal_moves[0]
+            
+            move_probs = {move: 1.0}
+            ctx.logProbabilities(move_probs)
+            if VERBOSE:
+                print(f"Instant move (cached): {move.uci()}")
+            return move
+        
+        # No cache - do a quick NN eval (still fast, just one forward pass)
+        try:
+            from .chess_policy.encoding import board_to_tensor, legal_mask_4672
+            from .chess_policy.infer import unpack_policy, mask_logits, probs_from_logits
+            from .chess_policy.move_index import index_to_move, POLICY_SIZE
+            
+            # Quick NN forward pass
+            x_np = board_to_tensor(ctx.board)
+            c_encoded = x_np.shape[0]
+            try:
+                c_model = int(getattr(model, "in_channels", c_encoded))
+            except Exception:
+                c_model = c_encoded
+            if c_encoded > c_model:
+                x_np = x_np[:c_model]
+            elif c_encoded < c_model:
+                pad = np.zeros((c_model - c_encoded, x_np.shape[1], x_np.shape[2]), dtype=x_np.dtype)
+                x_np = np.concatenate([x_np, pad], axis=0)
+            
+            x = torch.from_numpy(x_np).unsqueeze(0).to(device)
+            model.eval()
+            with torch.inference_mode():
+                output = model(x)
+                logits_b, v_pred = unpack_policy(output)
+                logits = logits_b[0] if logits_b.dim() == 2 and logits_b.size(0) == 1 else logits_b
+            
+            # Get top move instantly
+            legal = torch.from_numpy(legal_mask_4672(ctx.board)).to(logits.device)
+            masked = mask_logits(logits, legal)
+            probs = probs_from_logits(masked, temperature=0.0)  # Deterministic
+            
+            idx = int(torch.argmax(probs).item())
+            move = index_to_move(ctx.board, idx) if 0 <= idx < POLICY_SIZE else None
+            
+            if move is None or move not in legal_moves:
+                order = torch.argsort(probs, descending=True).tolist()
+                for i in order:
+                    if 0 <= i < POLICY_SIZE:
+                        mv_try = index_to_move(ctx.board, int(i))
+                        if mv_try is not None and mv_try in legal_moves:
+                            move = mv_try
+                            break
+                if move is None or move not in legal_moves:
+                    move = legal_moves[0]
+            
+            # Cache the evaluation for future instant moves (if we see this position again)
+            value = 0.0
+            if v_pred is not None:
+                v = v_pred
+                if v.dim() == 2 and v.size(0) == 1:
+                    v = v[0]
+                value = float(v.squeeze(-1).cpu().item())
+            _cache_nn_eval(ctx.board, logits.detach().cpu(), value)
+            
+            move_probs = {move: 1.0}
+            ctx.logProbabilities(move_probs)
+            if VERBOSE:
+                print(f"Instant move (quick NN): {move.uci()}")
+            return move
+        except Exception as e:
+            # If even NN eval fails, just return first legal move
+            if VERBOSE:
+                print(f"Instant mode fallback: {e}")
+            move = legal_moves[0]
+            move_probs = {move: 1.0}
+            ctx.logProbabilities(move_probs)
+            return move
 
     # Update engine's board to match current position
     engine.board = ctx.board.copy()
@@ -881,6 +994,7 @@ def test_func(ctx: GameContext):
     if PURE_POLICY_BULLET:
         if USE_HYBRID_MODE:
             # Hybrid mode: use pure policy when time is low or game is advanced
+            # NOTE: ctx.timeLeft comes from the platform (ChessHacks) via GameContext, not our own timer
             movetime_ms = ctx.timeLeft if ctx.timeLeft and ctx.timeLeft > 0 else 0
             if movetime_ms > 0 and movetime_ms < HYBRID_TIME_THRESHOLD_MS:
                 use_pure_policy = True
@@ -975,6 +1089,7 @@ def test_func(ctx: GameContext):
     # Default sims from engine config
     sims = engine.sims
     # Set default movetime_ms to avoid UnboundLocalError when ctx.timeLeft <= 0
+    # NOTE: ctx.timeLeft comes from the platform (ChessHacks) via GameContext, not our own timer
     movetime_ms = ctx.timeLeft if ctx.timeLeft and ctx.timeLeft > 0 else 0
     
     if movetime_ms > 0:
