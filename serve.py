@@ -41,14 +41,51 @@ async def root_get():
 @app.post("/")
 async def root():
     """Health check endpoint for server readiness (POST)."""
-    return JSONResponse(content={"running": True})
+    return JSONResponse(content={"running": True, "status": "ready"})
+
+@app.get("/health")
+async def health():
+    """Explicit health check endpoint."""
+    return JSONResponse(content={"running": True, "status": "ready"})
 
 
 @app.post("/move")
 async def get_move(request: Request):
     start_time = time.perf_counter()
     try:
-        data = await request.json()
+        # Try to get JSON body, but handle empty requests gracefully
+        try:
+            data = await request.json()
+        except Exception as json_error:
+            # If request has no body or invalid JSON, check if it's a health check
+            # Some platforms send empty POST requests as health checks
+            content_type = request.headers.get("content-type", "")
+            print(f"DEBUG: /move endpoint received request with content-type: {content_type}, error: {json_error}")
+            if "application/json" not in content_type.lower():
+                # Not a JSON request - might be a health check
+                print("DEBUG: Treating as health check (no JSON content-type)")
+                return JSONResponse(
+                    content={
+                        "running": True,
+                        "status": "ready",
+                        "error": None,
+                    },
+                    status_code=200,
+                )
+            # Otherwise, it's a real error
+            time_taken = (time.perf_counter() - start_time) * 1000
+            print(f"DEBUG: Returning 400 for invalid JSON: {json_error}")
+            return JSONResponse(
+                content={
+                    "move": None,
+                    "move_probs": None,
+                    "time_taken": time_taken,
+                    "error": f"Invalid JSON: {str(json_error)}",
+                    "logs": None,
+                    "exception": str(json_error),
+                },
+                status_code=400,
+            )
     except Exception as e:
         time_taken = (time.perf_counter() - start_time) * 1000
         return JSONResponse(
@@ -56,21 +93,38 @@ async def get_move(request: Request):
                 "move": None,
                 "move_probs": None,
                 "time_taken": time_taken,
-                "error": f"Invalid JSON: {str(e)}",
+                "error": f"Request error: {str(e)}",
                 "logs": None,
                 "exception": str(e),
             },
             status_code=400,
         )
 
+    # Handle case where data might be None or empty
+    if not data:
+        return JSONResponse(
+            content={
+                "running": True,
+                "status": "ready",
+                "error": None,
+            },
+            status_code=200,
+        )
+
     if ("pgn" not in data or "timeleft" not in data):
         time_taken = (time.perf_counter() - start_time) * 1000
+        missing_fields = []
+        if "pgn" not in data:
+            missing_fields.append("pgn")
+        if "timeleft" not in data:
+            missing_fields.append("timeleft")
+        print(f"DEBUG: Missing required fields: {missing_fields}, received keys: {list(data.keys()) if data else 'None'}")
         return JSONResponse(
             content={
                 "move": None,
                 "move_probs": None,
                 "time_taken": time_taken,
-                "error": "Missing pgn or timeleft",
+                "error": f"Missing required fields: {', '.join(missing_fields)}. Received keys: {list(data.keys()) if data else 'None'}",
                 "logs": None,
             },
             status_code=400,
