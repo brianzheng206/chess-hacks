@@ -30,7 +30,7 @@ import torch
 import pathlib
 REPO_ROOT = pathlib.Path(__file__).parent.parent
 # Use stockfish_949.pt from local repository
-MODEL_PATH = str(REPO_ROOT / "best_policy.pt")
+MODEL_PATH = str(REPO_ROOT / "stockfish_949.pt")
 # Opening book enabled
 OPENING_BOOK_PATH = str(REPO_ROOT / "opening_book.pkl") if (REPO_ROOT / "opening_book.pkl").exists() else None
 
@@ -117,8 +117,8 @@ if model is not None:
         engine = UciEngine(
             model,
             use_puct=True,
-            sims=150,  # Lower default for 1-min games (will be adjusted by time management)
-            c_puct=0.6,  # Lower to trust policy more, faster convergence for 1-min games
+            sims=175,  # Lower default for 1-min games (will be adjusted by time management)
+            c_puct=0.7,  # Lower to trust policy more, faster convergence for 1-min games
             device=device,
             opening_book_path=OPENING_BOOK_PATH,
             opening_max_ply=8,
@@ -497,7 +497,7 @@ def test_func(ctx: GameContext):
     elif game_phase < 0.3:  # Endgame
         # In endgame, be very efficient when time is low - trust policy heavily
         if movetime_ms < 8000:  # Less than 8 seconds: time pressure
-            sims = min(sims, 50)  # Very low cap when time is low
+            sims = min(sims, 60)  # Very low cap when time is low
             if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
                 engine.mcts_config.c_puct = 0.4  # Trust policy very heavily in time trouble
         elif movetime_ms < 15000:  # 8-15 seconds: moderate time
@@ -511,7 +511,7 @@ def test_func(ctx: GameContext):
     else:  # Midgame - BE CAREFUL, search more
         # Midgame is critical - use more simulations and be more thorough
         if movetime_ms > 30000:  # Plenty of time: search carefully
-            sims = min(sims, 150)  # Higher cap for careful search (but still reasonable for 1-min)
+            sims = min(sims, 200)  # Higher cap for careful search (but still reasonable for 1-min)
             if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
                 engine.mcts_config.c_puct = 0.6  # Balanced, trust policy but explore
         elif movetime_ms > 15000:  # Moderate time: still careful
@@ -693,7 +693,7 @@ def test_func(ctx: GameContext):
                     # Early opening (ply 0-4): trust book more (threshold 0.25-0.3)
                     # Mid opening (ply 4+): more flexible (threshold 0.15-0.2)
                     # High confidence book move (>0.8): trust more (increase threshold)
-                    base_threshold = 0.25 if current_ply < 4 else 0.18
+                    base_threshold = 0.20 if current_ply < 4 else 0.18
                     if book_move_weight > 0.8:
                         threshold = base_threshold + 0.1  # Trust high-confidence moves more
                     else:
