@@ -2,16 +2,16 @@
 """
 Test inference script for stockfish_949.pt model.
 This script demonstrates running inference on the chess model using the architecture
-from /home/brianzheng/chess-engine/src.
+from src/chess_policy (local copy).
 """
 
 import sys
 import pathlib
 
-# Add chess-engine to path
-chess_engine_path = "/home/brianzheng/chess-engine/src"
-if chess_engine_path not in sys.path:
-    sys.path.insert(0, chess_engine_path)
+# Add src to path to import local chess_policy
+src_path = str(pathlib.Path(__file__).parent / "src")
+if src_path not in sys.path:
+    sys.path.insert(0, src_path)
 
 import torch
 import chess

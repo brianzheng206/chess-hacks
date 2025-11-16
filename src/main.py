@@ -8,7 +8,7 @@ import time
 from functools import lru_cache
 
 # Compatibility shim for python-chess transposition_key
-# The chess-engine expects board.transposition_key() as a method
+# The chess_policy code expects board.transposition_key() as a method
 # but some python-chess versions use _transposition_key as an attribute
 if not hasattr(Board, 'transposition_key'):
     def transposition_key(self):
@@ -16,14 +16,10 @@ if not hasattr(Board, 'transposition_key'):
         return self._transposition_key
     Board.transposition_key = transposition_key
 
-# Add chess-engine to path
-chess_engine_path = "/home/brianzheng/chess-engine/src"
-if chess_engine_path not in sys.path:
-    sys.path.insert(0, chess_engine_path)
-
-from chess_policy.train import load_checkpoint
-from chess_policy.uci import UciEngine
-from chess_policy.infer import choose_move
+# Use local chess_policy module (copied into src/chess_policy)
+from .chess_policy.train import load_checkpoint
+from .chess_policy.uci import UciEngine
+from .chess_policy.infer import choose_move
 import torch
 
 # Write code here that runs once
@@ -33,8 +29,8 @@ import torch
 # Get the directory where this file is located, then go up to repo root
 import pathlib
 REPO_ROOT = pathlib.Path(__file__).parent.parent
-# Use stockfish_949.pt from chess-engine directory
-MODEL_PATH = "/home/brianzheng/chess-engine/stockfish_949.pt"
+# Use stockfish_949.pt from local repository
+MODEL_PATH = str(REPO_ROOT / "stockfish_949.pt")
 # Opening book enabled
 OPENING_BOOK_PATH = str(REPO_ROOT / "opening_book.pkl") if (REPO_ROOT / "opening_book.pkl").exists() else None
 
@@ -60,7 +56,7 @@ try:
     # Use exact architecture from metadata (no defaults!)
     arch = meta["arch"]
     if arch == "PolicyValueResNet":
-        from chess_policy.model import PolicyValueResNet
+        from .chess_policy.model import PolicyValueResNet
         in_ch = meta["in_channels"]  # Must match exactly
         width = meta["width"]  # Must match exactly
         blocks = meta["n_blocks"]  # Must match exactly
@@ -78,8 +74,8 @@ try:
     print("Model loaded successfully (strict=True, architecture matches checkpoint)")
     # Verify model loaded correctly by checking a test inference
     import chess
-    from chess_policy.infer import choose_move
-    from chess_policy.move_index import move_to_index
+    from .chess_policy.infer import choose_move
+    from .chess_policy.move_index import move_to_index
     test_board = chess.Board()
     test_board.push(chess.Move.from_uci('e2e4'))
     test_move, test_probs, test_value = choose_move(test_board, model, device=device, temperature=0.7, sample=False)
@@ -154,11 +150,20 @@ def search_with_budget(engine, board, sims_cap, time_ms):
     # Spend ~5% of remaining time, bounded [80ms, 300ms]
     budget_s = max(0.08, min(0.30, (time_ms / 1000.0) * 0.05))
     
-    if hasattr(engine, "search") and engine.search is not None:
+    if hasattr(engine, "search_tree") and engine.search_tree is not None and hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
         # Use smaller sims to stay within time budget
-        # The search method doesn't support time_budget parameter, so we use sims
         sims_small = max(50, min(sims_cap, 120))
-        move = engine.search.search(board, simulations=sims_small)
+        # Create a temporary search tree for this board
+        from .chess_policy.mcts import SearchTree, SearchConfig
+        temp_config = SearchConfig(
+            n_simulations=sims_small,
+            c_puct=engine.mcts_config.c_puct,
+            device=engine.device,
+            temperature=engine.mcts_config.temperature,
+            use_dirichlet_noise=engine.mcts_config.use_dirichlet_noise,
+        )
+        temp_tree = SearchTree(board, engine.model, temp_config)
+        move, _ = temp_tree.search()
         
         elapsed = time.monotonic() - start
         # Allow a tiny top-up if we're way under budget (but cap it)
@@ -166,7 +171,15 @@ def search_with_budget(engine, board, sims_cap, time_ms):
             remaining_budget = budget_s - elapsed
             if remaining_budget > 0.05:  # At least 50ms remaining
                 topup_sims = min(int(sims_small * 0.5), 60)
-                move2 = engine.search.search(board, simulations=topup_sims)
+                temp_config2 = SearchConfig(
+                    n_simulations=topup_sims,
+                    c_puct=engine.mcts_config.c_puct,
+                    device=engine.device,
+                    temperature=engine.mcts_config.temperature,
+                    use_dirichlet_noise=engine.mcts_config.use_dirichlet_noise,
+                )
+                temp_tree2 = SearchTree(board, engine.model, temp_config2)
+                move2, _ = temp_tree2.search()
                 if move2 is not None:
                     move = move2
         
@@ -204,6 +217,22 @@ def test_func(ctx: GameContext):
 
     # Update engine's board to match current position
     engine.board = ctx.board.copy()
+    
+    # Try to update search tree if it exists and position changed
+    # This handles tree reuse when opponent plays a move
+    if hasattr(engine, 'search_tree') and engine.search_tree is not None:
+        try:
+            # Check if we can update the tree to match current position
+            # If the tree's root is one move away (opponent's move), update it
+            if engine.search_tree.root_state.fen() != ctx.board.fen():
+                # Position changed - could be opponent's move
+                # Try to find if any child of current root matches the new position
+                # For now, we'll recreate if position doesn't match (simple approach)
+                # A more sophisticated approach would check if position is reachable from tree
+                engine.search_tree = None  # Will be recreated below if needed
+        except Exception:
+            # If check fails, reset tree
+            engine.search_tree = None
     
     # Convert to list for easier access
     legal_move_list = list(legal_moves)
@@ -249,7 +278,7 @@ def test_func(ctx: GameContext):
         
         # Convert probabilities tensor to dictionary of Move -> probability for logging
         # Use move_to_index to map moves to indices (more reliable than index_to_move)
-        from chess_policy.move_index import move_to_index
+        from .chess_policy.move_index import move_to_index
         
         move_probs = {}
         
@@ -303,7 +332,7 @@ def test_func(ctx: GameContext):
         
         # Always check the raw tensor to see what the model actually output
         if probs_tensor is not None:
-            from chess_policy.encoding import legal_mask_4672
+            from .chess_policy.encoding import legal_mask_4672
             legal_mask = legal_mask_4672(ctx.board)
             legal_probs_raw = [float(probs_tensor[i].item()) for i in range(len(probs_tensor)) if legal_mask[i] > 0.5]
             if legal_probs_raw:
@@ -393,16 +422,16 @@ def test_func(ctx: GameContext):
     # Phase-aware adjustments
     if game_phase > 0.7:  # Opening
         sims = min(sims, 120)
-        if hasattr(engine, 'search') and engine.search is not None:
-            engine.search.c_puct = 1.4
+        if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
+            engine.mcts_config.c_puct = 1.4
     elif game_phase < 0.3:  # Endgame
         sims = min(sims, 100)
-        if hasattr(engine, 'search') and engine.search is not None:
-            engine.search.c_puct = 0.9
+        if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
+            engine.mcts_config.c_puct = 0.9
     else:  # Midgame
         sims = min(sims, 150)
-        if hasattr(engine, 'search') and engine.search is not None:
-            engine.search.c_puct = 1.2
+        if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
+            engine.mcts_config.c_puct = 1.2
     
     # ------------------------------
     # STEP 3: SELECTION STRATEGY (using UCI engine logic)
@@ -412,6 +441,10 @@ def test_func(ctx: GameContext):
 
     try:
         # Determine if we're in opening phase (same logic as UCI engine)
+        # Ensure engine has required attributes
+        if not hasattr(engine, 'mcts_config'):
+            # This shouldn't happen if engine is properly initialized, but handle it gracefully
+            print("Warning: engine.mcts_config not found, MCTS features disabled")
         in_opening = False
         if engine.opening_adaptive_depth:
             # Adaptive: check if position is in opening book
@@ -424,7 +457,12 @@ def test_func(ctx: GameContext):
         # If in opening phase, check for tactical opportunities first
         # This allows the engine to catch blunders even during opening book moves
         if in_opening:
-            tactical_move = engine._check_tactical_opportunity()
+            try:
+                tactical_move = engine._check_tactical_opportunity()
+            except AttributeError as e:
+                # Handle any attribute errors gracefully
+                print(f"Warning: Error in _check_tactical_opportunity: {e}")
+                tactical_move = None
             if tactical_move is not None:
                 # Found a tactical opportunity - use it instead of opening book
                 decision_mode = "Tactical opportunity"
@@ -456,16 +494,32 @@ def test_func(ctx: GameContext):
             # Check if the model is very confident in a different move
             # If top model move has >30% probability and is different from opening book, compare them
             if top_model_move is not None and top_model_move != mv and top_model_prob > 0.3:
-                # Model is confident in a different move - compare with opening book using PUCT
-                if engine.use_puct and engine.search is not None:
-                    # Quick evaluation of both moves
+                # Model is confident in a different move - compare with opening book using MCTS
+                if engine.use_puct and hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
+                    # Quick evaluation of both moves using MCTS
+                    from .chess_policy.mcts import SearchTree, SearchConfig
+                    quick_config = SearchConfig(
+                        n_simulations=50,
+                        c_puct=engine.mcts_config.c_puct,
+                        device=engine.device,
+                        temperature=0.0,
+                        use_dirichlet_noise=False,
+                    )
                     test_board_book = ctx.board.copy()
                     test_board_book.push(mv)
-                    value_book = -engine.search._rollout_value(test_board_book)
+                    temp_tree_book = SearchTree(test_board_book, engine.model, quick_config)
+                    _, _ = temp_tree_book.search()
+                    # Get value from root node
+                    value_book_raw = temp_tree_book.root.q_value if hasattr(temp_tree_book, 'root') and temp_tree_book.root.visit_count > 0 else 0.0
+                    value_book = -value_book_raw  # Negate: opponent's perspective -> ours
                     
                     test_board_model = ctx.board.copy()
                     test_board_model.push(top_model_move)
-                    value_model = -engine.search._rollout_value(test_board_model)
+                    temp_tree_model = SearchTree(test_board_model, engine.model, quick_config)
+                    _, _ = temp_tree_model.search()
+                    # Get value from root node
+                    value_model_raw = temp_tree_model.root.q_value if hasattr(temp_tree_model, 'root') and temp_tree_model.root.visit_count > 0 else 0.0
+                    value_model = -value_model_raw  # Negate: opponent's perspective -> ours
                     
                     # If model move is better or similar (within 0.1), use it
                     # Also if model confidence is very high (>40%), prefer it
@@ -495,16 +549,21 @@ def test_func(ctx: GameContext):
                         engine._recent_positions.pop(0)
                     return move
             
-            # If we have PUCT available, do a quick search to see if there's a better move
+            # If we have MCTS available, do a quick search to see if there's a better move
             # This catches subtle advantages that the simple tactical check might miss
-            if engine.use_puct and engine.search is not None:
+            if engine.use_puct and hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
                 # Quick search with fewer simulations (50-100) to compare with opening book
                 quick_sims = min(100, max(50, engine.sims // 4))
-                # Use time budget if available
-                time_budget_s = None
-                if ctx.timeLeft > 0:
-                    time_budget_s = (ctx.timeLeft / 1000.0) * 0.1  # Use 10% of time for quick search
-                search_move = engine.search.search(ctx.board, simulations=quick_sims, time_budget_s=time_budget_s)
+                from .chess_policy.mcts import SearchTree, SearchConfig
+                quick_config = SearchConfig(
+                    n_simulations=quick_sims,
+                    c_puct=engine.mcts_config.c_puct,
+                    device=engine.device,
+                    temperature=0.0,
+                    use_dirichlet_noise=False,
+                )
+                quick_tree = SearchTree(ctx.board, engine.model, quick_config)
+                search_move, _ = quick_tree.search()
                 
                 if search_move is not None and search_move != mv:
                     # Compare values: get evaluation for both moves
@@ -512,11 +571,19 @@ def test_func(ctx: GameContext):
                     # to get it from our perspective
                     test_board_book = ctx.board.copy()
                     test_board_book.push(mv)
-                    value_book = -engine.search._rollout_value(test_board_book)  # Negate: opponent's perspective -> ours
+                    temp_tree_book = SearchTree(test_board_book, engine.model, quick_config)
+                    _, _ = temp_tree_book.search()
+                    # Get value from root node
+                    value_book_raw = temp_tree_book.root.q_value if hasattr(temp_tree_book, 'root') and temp_tree_book.root.visit_count > 0 else 0.0
+                    value_book = -value_book_raw  # Negate: opponent's perspective -> ours
                     
                     test_board_search = ctx.board.copy()
                     test_board_search.push(search_move)
-                    value_search = -engine.search._rollout_value(test_board_search)  # Negate: opponent's perspective -> ours
+                    temp_tree_search = SearchTree(test_board_search, engine.model, quick_config)
+                    _, _ = temp_tree_search.search()
+                    # Get value from root node
+                    value_search_raw = temp_tree_search.root.q_value if hasattr(temp_tree_search, 'root') and temp_tree_search.root.visit_count > 0 else 0.0
+                    value_search = -value_search_raw  # Negate: opponent's perspective -> ours
                     
                     # Adaptive threshold: higher for early opening and high-confidence book moves
                     # Early opening (ply 0-4): trust book more (threshold 0.25-0.3)
@@ -553,32 +620,35 @@ def test_func(ctx: GameContext):
                 engine._recent_positions.pop(0)
             return move
         
-        # Use model/PUCT for non-opening positions
-        if engine.use_puct and engine.search is not None:
-            decision_mode = "PUCT search"
+        # Use model/MCTS for non-opening positions
+        if engine.use_puct and hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
+            decision_mode = "MCTS search"
             print(f"Decision mode: {decision_mode} (ply {current_ply}, phase={game_phase:.2f})")
             
-            # Parse time budget if available
-            time_budget_s = None
-            if ctx.timeLeft > 0:
-                time_budget_s = (ctx.timeLeft / 1000.0) * 0.8  # Use 80% of remaining time
+            # Initialize or update search tree
+            from .chess_policy.mcts import SearchTree
+            if not hasattr(engine, 'search_tree') or engine.search_tree is None:
+                # No existing tree - create new one
+                engine.search_tree = SearchTree(ctx.board, engine.model, engine.mcts_config)
+            else:
+                # Check if tree matches current position
+                try:
+                    if engine.search_tree.root_state.fen() != ctx.board.fen():
+                        # Position changed - try to reuse tree if we can update it
+                        # For now, create new tree (could be improved to check if position is one move away)
+                        engine.search_tree = SearchTree(ctx.board, engine.model, engine.mcts_config)
+                except Exception:
+                    # If comparison fails, create new tree
+                    engine.search_tree = SearchTree(ctx.board, engine.model, engine.mcts_config)
+            
+            # Update config with current sims
+            engine.mcts_config.n_simulations = sims
             
             # Search for best move
             search_start = time.monotonic()
-            mv = engine.search.search(ctx.board, simulations=sims, time_budget_s=time_budget_s)
+            mv, visit_dist = engine.search_tree.search(max_simulations_override=sims)
             search_time = (time.monotonic() - search_start) * 1000
             print(f"Search: {search_time:.1f} ms (sims={sims})")
-            
-            try:
-                cs = engine.search.cache_stats()
-                print(
-                    f"PUCT cache size={cs['size']} "
-                    f"eval_cache={cs.get('eval_cache_size', 0)} "
-                    f"hits={cs['hits']} misses={cs['misses']} "
-                    f"hit_rate={cs['hit_rate']:.3f}"
-                )
-            except Exception:
-                pass
             
             # If move would lead to a position we've seen recently, try to avoid it
             if mv is not None:
@@ -589,16 +659,24 @@ def test_func(ctx: GameContext):
                 if test_fen in engine._recent_positions[-3:]:
                     print("Warning: Best move leads to recent repetition, re-searching with more sims...")
                     # Re-search with more simulations to potentially get different move
-                    mv = engine.search.search(ctx.board, simulations=sims * 2, time_budget_s=time_budget_s)
+                    mv, _ = engine.search_tree.search(max_simulations_override=sims * 2)
             
             # Log root value prediction (from current player's perspective)
-            try:
-                v = engine.search._rollout_value(ctx.board)
+            if hasattr(engine.search_tree, 'root') and engine.search_tree.root.visit_count > 0:
+                v = engine.search_tree.root.q_value
                 print(f"info string root_value {v:.3f}")
-            except Exception:
-                pass
             
             move = mv
+            
+            # Update search tree for next move (tree reuse)
+            # This allows the next search to reuse the subtree under the played move
+            if move is not None and hasattr(engine, 'search_tree') and engine.search_tree is not None:
+                try:
+                    engine.search_tree.update_root(move)
+                except Exception as e:
+                    # If update fails, tree will be recreated on next search
+                    print(f"Warning: Failed to update search tree: {e}")
+                    engine.search_tree = None
         else:
             # Use greedy policy selection (fast, no search)
             decision_mode = "Greedy policy"

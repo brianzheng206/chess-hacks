@@ -12,6 +12,12 @@ from src import main
 app = FastAPI()
 
 
+@app.get("/")
+async def root_get():
+    """Health check endpoint for server readiness."""
+    return JSONResponse(content={"running": True, "status": "ready"})
+
+
 @app.post("/")
 async def root():
     return JSONResponse(content={"running": True})
