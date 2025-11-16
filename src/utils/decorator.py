@@ -62,6 +62,9 @@ class ChessManager:
         return wrapper
 
     def set_context(self, pgn: str, timeleft: int):
+        # Reset move probabilities for new move request
+        # This ensures we don't have stale data from previous moves
+        self._move_probabilities = {}
 
         game = read_game(io.StringIO(pgn))
 

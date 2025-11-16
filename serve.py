@@ -175,13 +175,38 @@ async def get_move(request: Request):
             status_code=500,
         )
 
-    # Confirm type of move_probs
+    # Confirm type of move_probs and validate
     if not isinstance(move_probs, dict):
-        return JSONResponse(content={"move": None, "move_probs": None, "error": "Failed to get move", "message": "Move probabilities is not a dictionary"}, status_code=500)
-
+        print(f"ERROR: move_probs is not a dict, type: {type(move_probs)}, value: {move_probs}")
+        # Fallback: create a simple probability dict
+        if move is not None:
+            move_probs = {move: 1.0}
+        else:
+            return JSONResponse(content={"move": None, "move_probs": None, "error": "Failed to get move", "message": "Move probabilities is not a dictionary and no move available"}, status_code=500)
+    
+    # If move_probs is empty, create a fallback
+    if not move_probs and move is not None:
+        print(f"WARNING: move_probs is empty, creating fallback for move {move.uci()}")
+        move_probs = {move: 1.0}
+    
+    # Validate move_probs contents
+    validated_move_probs = {}
     for m, prob in move_probs.items():
-        if not isinstance(m, chess.Move) or not isinstance(prob, float):
-            return JSONResponse(content={m: None, "move_probs": None, "error": "Failed to get move", "message": "Move probabilities is not a dictionary"}, status_code=500)
+        if isinstance(m, chess.Move) and isinstance(prob, (float, int)):
+            validated_move_probs[m] = float(prob)
+        else:
+            print(f"WARNING: Invalid entry in move_probs: move={m} (type: {type(m)}), prob={prob} (type: {type(prob)})")
+    
+    # If validation removed all entries but we have a move, add it
+    if not validated_move_probs and move is not None:
+        print(f"WARNING: All move_probs entries were invalid, using fallback for move {move.uci()}")
+        validated_move_probs = {move: 1.0}
+    
+    # If still no valid move_probs, return error
+    if not validated_move_probs:
+        return JSONResponse(content={"move": None, "move_probs": None, "error": "Failed to get move", "message": "No valid move probabilities available"}, status_code=500)
+    
+    move_probs = validated_move_probs
 
     # Translate move_probs to Dict[str, float]
     move_probs_dict = {move.uci(): prob for move, prob in move_probs.items()}

@@ -1847,18 +1847,15 @@ def test_func(ctx: GameContext):
         move = policy_move if policy_move is not None and policy_move in legal_moves else legal_move_list[0]
         print(f"Selected move (exception fallback): {move.uci()}")
         
-        # Print move time if debug is enabled (even on exception)
-        if DEBUG_MOVE_TIME and move_start_time is not None:
-            move_time_ms = (time.monotonic() - move_start_time) * 1000
-            current_ply = len(ctx.board.move_stack) if hasattr(ctx, 'board') else 0
-            print(f"[DEBUG_MOVE_TIME] Total move time (exception): {move_time_ms:.1f} ms (ply {current_ply})")
-        
-        # Final tactical sanity check: if we somehow missed a mate in 1 or huge free capture,
-        # override the chosen move. This acts as a "guard rail" around the whole decision logic.
         # Ensure legal_moves is available (might not be if exception occurred early)
         if 'legal_moves' not in locals() or legal_moves is None:
             legal_moves = list(ctx.board.generate_legal_moves())
+            if not legal_moves:
+                ctx.logProbabilities({})
+                raise ValueError("No legal moves available (i probably lost didn't i)")
         
+        # Final tactical sanity check: if we somehow missed a mate in 1 or huge free capture,
+        # override the chosen move. This acts as a "guard rail" around the whole decision logic.
         mate_mv = None
         board = ctx.board
         for mv in legal_moves:
@@ -1879,6 +1876,29 @@ def test_func(ctx: GameContext):
                 if VERBOSE:
                     print(f"Overriding move {move.uci()} with obvious winning capture {tactical_mv.uci()}")
                 move = tactical_mv
+        
+        # CRITICAL: Always ensure logProbabilities is called before returning
+        # This ensures move_probs is set even in exception cases
+        try:
+            # Try to use existing move_probs if available, otherwise create a simple one
+            if 'move_probs' in locals() and move_probs and isinstance(move_probs, dict) and move in move_probs:
+                ctx.logProbabilities(move_probs)
+            else:
+                # Fallback: create a simple probability dict for the selected move
+                ctx.logProbabilities({move: 1.0})
+        except Exception as log_err:
+            print(f"Warning: logProbabilities failed in exception handler: {log_err}")
+            # Last resort: try one more time with a simple dict
+            try:
+                ctx.logProbabilities({move: 1.0})
+            except:
+                pass  # If this fails, we've done our best
+        
+        # Print move time if debug is enabled (even on exception)
+        if DEBUG_MOVE_TIME and move_start_time is not None:
+            move_time_ms = (time.monotonic() - move_start_time) * 1000
+            current_ply = len(ctx.board.move_stack) if hasattr(ctx, 'board') else 0
+            print(f"[DEBUG_MOVE_TIME] Total move time (exception): {move_time_ms:.1f} ms (ply {current_ply})")
         
         return move
 
