@@ -224,7 +224,7 @@ class SearchNode:
         - See BatchEvaluator docstring for more details on parallel MCTS requirements.
     """
     __slots__ = ('parent', 'children', 'prior', 'visit_count', 'value_sum', 'state', 
-                 'is_expanded', 'is_terminal', 'terminal_value', 'to_play')
+                 'is_expanded', 'is_terminal', 'terminal_value', 'to_play', 'fen')
     
     def __init__(
         self,
@@ -251,6 +251,8 @@ class SearchNode:
         self.is_terminal = False
         self.terminal_value: Optional[float] = None
         self.to_play = to_play
+        # Cache FEN to avoid repeated computation (micro-optimization)
+        self.fen: Optional[str] = state.fen() if state is not None and hasattr(state, 'fen') else None
     
     def clear(self) -> None:
         """Clear all children and reset node state (useful for tree reuse)."""
@@ -311,6 +313,7 @@ class SearchNode:
                 state=child_state,
                 to_play=child_to_play,
             )
+            # FEN is automatically cached in SearchNode.__init__ from child_state
             self.children[move] = child_node
         
         self.is_expanded = True
@@ -361,11 +364,12 @@ class SearchTree:
         # Reusable batch evaluator for cross-search caching
         # This allows cache hits across multiple search calls (e.g., similar positions)
         device = torch.device(config.device) if isinstance(config.device, str) else config.device
-        # Better batch size heuristic: larger batches for GPU
+        # Optimized batch size heuristic: larger batches for better GPU utilization
         if device.type == "cuda":
-            batch_size = min(64, max(8, config.n_simulations // 2))  # GPU: prefer larger batches
+            # Use larger batches for GPU: up to 128 for better throughput
+            batch_size = min(128, max(16, config.n_simulations // 2))
         else:
-            batch_size = min(16, max(4, config.n_simulations // 4))  # CPU: smaller is okay
+            batch_size = min(32, max(4, config.n_simulations // 4))  # CPU: moderate batches
         self.batch_evaluator = BatchEvaluator(model, device, batch_size=batch_size)
         
         # Determine to_play from root_state
@@ -689,12 +693,14 @@ class BatchEvaluator:
             
             # Stack into batch tensor [B, C, 8, 8] and move to GPU in one operation
             batch_x = np.stack(batch_tensors, axis=0)
-            # Use non_blocking=True for faster CPU->GPU transfer
-            x = torch.from_numpy(batch_x).to(self.device, non_blocking=True)
+            # Use non_blocking=True for faster CPU->GPU transfer, and float32 explicitly
+            x = torch.from_numpy(batch_x).to(self.device, dtype=torch.float32, non_blocking=True)
             
             # Run model on batch (all on GPU)
+            # Use inference_mode for better performance (disables autograd completely)
             self.model.eval()
             with torch.inference_mode():
+                # Ensure model is in eval mode and use no_grad context for maximum speed
                 output = self.model(x)
                 logits_batch, v_pred_batch = unpack_policy(output)
                 
@@ -775,15 +781,46 @@ class BatchEvaluator:
         Thread-safe: Uses lock to prevent race conditions.
         
         Returns:
-            True if batch is full or has at least 1 state (for better GPU utilization), False otherwise.
-            Very aggressive threshold (1) to batch immediately and reduce single evaluations.
+            True if batch is full or has at least 1 state.
+            
+        Note on single-threaded batching:
+            In single-threaded MCTS (current implementation), this returns True when
+            pending_count >= 1, meaning each state is evaluated immediately. This means
+            we're not really "batching" multiple states together - batches are effectively
+            size 1. The main benefit is caching: the FEN cache prevents re-evaluating
+            the same position across different simulations and searches.
+            
+            For true GPU batching (evaluating multiple states in parallel), you would need
+            to refactor mcts_search to:
+            1. Run selection phase for multiple simulations (collect leaves without evaluating)
+            2. Accumulate B leaves, then batch evaluate them all at once
+            3. Run backup phase for each leaf using the cached results
+            
+            This would provide better GPU utilization but requires algorithm changes.
+            The current approach prioritizes simplicity and caching benefits.
         """
         with self._lock:
             pending_count = len(self.pending_states)
             return pending_count >= self.batch_size or pending_count >= 1
     
+    def cache_single_result(self, state: GameState, logits: torch.Tensor, value: float) -> None:
+        """Cache a single evaluation result for a state.
+        
+        Public API for caching results from single evaluations (non-batched).
+        Thread-safe: Uses lock to prevent race conditions.
+        
+        Args:
+            state: Game state to cache.
+            logits: Policy logits tensor (will be moved to CPU if needed).
+            value: Value prediction.
+        """
+        # Ensure logits are on CPU for caching (consistent with batch results)
+        if logits.device.type != 'cpu':
+            logits = logits.cpu()
+        self._cache_result(state, logits, value, is_single=True)
+    
     def _cache_result(self, state: GameState, logits: torch.Tensor, value: float, is_single: bool = False) -> None:
-        """Cache a result for a state.
+        """Cache a result for a state (internal method).
         
         Thread-safe: Uses lock to prevent race conditions.
         
@@ -851,6 +888,10 @@ def evaluate_state_with_model(
         batch_evaluator.add_state(state)
         
         # Check if we should evaluate now (thread-safe)
+        # Note: In single-threaded mode, should_eval_now() returns True for any pending state,
+        # so this effectively evaluates immediately (batch size = 1). The main benefit is
+        # caching via results_cache, not true GPU batching. See should_eval_now() docstring
+        # for details on how to achieve true batching.
         if batch_evaluator.should_eval_now():
             batch_evaluator.evaluate_batch()
             # Get result after batch evaluation (thread-safe, but don't double-count cache hit)
@@ -906,7 +947,7 @@ def evaluate_state_with_model(
     
     # Cache result if batch evaluator is provided (thread-safe)
     if batch_evaluator is not None:
-        batch_evaluator._cache_result(state, logits.cpu(), value, is_single=True)
+        batch_evaluator.cache_single_result(state, logits.cpu(), value)
     
     return logits.cpu(), value
 
@@ -1099,127 +1140,187 @@ def run_simulation(
     model: nn.Module,
     config: SearchConfig,
     batch_evaluator: Optional[BatchEvaluator] = None,
+    max_depth_override: Optional[int] = None,
 ) -> None:
     """Run a single MCTS simulation starting at root.
-    
+
     Performs selection (descending to a leaf using PUCT), expansion (evaluating
     the leaf with the model), and backup (propagating the value back up the tree
     with sign flips).
-    
+
+    This version optimizes board handling:
+        - If the game state supports push/pop (e.g., python-chess.Board), we reuse
+          the root_state and apply moves with push/pop, then undo them at the end.
+        - If it does not, we fall back to the previous behavior of copying once
+          at the start of the simulation.
+
     Args:
         root: Root node of the search tree (should already be expanded).
         root_state: Game state at the root node.
         model: Neural network model for position evaluation.
         config: SearchConfig with search parameters (c_puct, max_depth, etc.).
-    
-    The simulation:
-    1. Selects a path from root to leaf using PUCT formula
-    2. Expands the leaf (if not terminal) using the model
-    3. Backs up the value along the path, flipping sign at each level
-    
-    Value backup:
-        Values are stored from the perspective of the player to move at each node.
-        When backing up from child to parent, the sign is flipped because the
-        value is from the child's perspective but needs to be from the parent's.
     """
     # Maintain path of nodes from root to leaf (for backup)
     path: list[SearchNode] = []
     
-    # Track state for expansion (we need the state at the leaf)
-    state = root_state.copy() if hasattr(root_state, 'copy') else root_state
-    depth = 0
-    node = root
+    # Decide whether we can use fast push/pop or need to copy
+    can_push_pop = hasattr(root_state, "push") and hasattr(root_state, "pop")
     
-    # Selection phase: descend from root to leaf using PUCT
-    while node.is_expanded and not node.is_terminal:
-        # Check depth limit
-        if config.max_depth is not None and depth >= config.max_depth:
-            break
+    # Use max_depth_override if provided, otherwise use config.max_depth
+    max_depth = max_depth_override if max_depth_override is not None else config.max_depth
+    
+    if can_push_pop:
+        # Use the root_state directly and rely on push/pop to traverse down and back up.
+        state = root_state
+        moves_played: list[AnyMoveType] = []
+        depth = 0
+        node = root
         
-        # Select child using PUCT
-        move, child = select_child(node, config.c_puct, config)
+        try:
+            # Selection phase: descend from root to leaf using PUCT
+            while node.is_expanded and not node.is_terminal:
+                # Check depth limit
+                if max_depth is not None and depth >= max_depth:
+                    break
+                
+                # Select child using PUCT
+                move, child = select_child(node, config.c_puct, config)
+                
+                # Add current node to path (before moving to child)
+                path.append(node)
+                moves_played.append(move)
+                
+                # Push move on the shared state to get to child's position
+                state.push(move)
+                
+                # Move to child
+                node = child
+                depth += 1
+            
+            # Current node is the leaf, state is the leaf's state
+            leaf_state = state
+            
+            # Add the leaf node to the path (path now includes root to leaf, inclusive)
+            path.append(node)
+            
+            # Expansion / evaluation phase
+            if node.is_terminal:
+                # Leaf is already terminal, use stored terminal value
+                leaf_value = node.terminal_value
+                if leaf_value is None:
+                    # Fallback: compute from state if needed
+                    if hasattr(leaf_state, "is_game_over") and leaf_state.is_game_over():
+                        result = leaf_state.result() if hasattr(leaf_state, "result") else "*"
+                        if hasattr(leaf_state, "is_checkmate") and leaf_state.is_checkmate():
+                            # Current player is mated: -1.0 from their POV
+                            leaf_value = -1.0
+                        elif result in ("1-0", "0-1"):
+                            leaf_value = -1.0
+                        else:
+                            leaf_value = 0.0
+                    else:
+                        leaf_value = 0.0
+            else:
+                # Expand the leaf node
+                # expand_node returns value from the POV of the player to move at the leaf
+                leaf_value = expand_node(node, leaf_state, model, config, batch_evaluator)
+            
+            # Ensure we have a valid value
+            if leaf_value is None:
+                leaf_value = 0.0
+            
+            # Backup phase: propagate value back up the tree with POV sign flips
+            value = float(leaf_value)  # leaf_value is from POV of the leaf's side to move
+            
+            # path is a list of nodes from root to leaf, inclusive
+            # We iterate in reverse (from leaf up to root) to back up the value
+            for node_in_path in reversed(path):
+                # Update this node with the current value (which is from this node's POV)
+                node_in_path.visit_count += 1
+                node_in_path.value_sum += value  # value must be from POV of node_in_path.to_play
+                
+                # Flip the value because the next node up the tree is the opponent's POV
+                value = -value
+        finally:
+           # Restore the root_state by popping all moves played in this simulation
+            if moves_played:
+                for _ in range(len(moves_played)):
+                    state.pop()
+    
+    else:
+        # Fallback: previous behavior using a copied state
+        state = root_state.copy() if hasattr(root_state, "copy") else root_state
+        depth = 0
+        node = root
         
-        # Add current node to path (before moving to child)
+        # Selection phase: descend from root to leaf using PUCT
+        while node.is_expanded and not node.is_terminal:
+            # Check depth limit
+            if max_depth is not None and depth >= max_depth:
+                break
+            
+            # Select child using PUCT
+            move, child = select_child(node, config.c_puct, config)
+            
+            # Add current node to path (before moving to child)
+            path.append(node)
+            
+            # Push move on state to get to child's state
+            if hasattr(state, "push"):
+                state.push(move)
+            else:
+                # Fallback: try to create new state by copying and applying move
+                try:
+                    new_state = state.copy() if hasattr(state, "copy") else state
+                    if hasattr(new_state, "push"):
+                        new_state.push(move)
+                    state = new_state
+                except Exception:
+                    # If we can't push the move, we've reached a leaf
+                    break
+            
+            # Move to child
+            node = child
+            depth += 1
+        
+        # Current node is the leaf, state is the leaf's state
+        leaf_state = state
+        
+        # Add the leaf node to the path (path now includes root to leaf, inclusive)
         path.append(node)
         
-        # Push move on state to get to child's state
-        if hasattr(state, 'push'):
-            state.push(move)
-        else:
-            # Fallback: try to create new state by copying and applying move
-            try:
-                new_state = state.copy() if hasattr(state, 'copy') else state
-                if hasattr(new_state, 'push'):
-                    new_state.push(move)
-                state = new_state
-            except Exception:
-                # If we can't push the move, we've reached a leaf
-                break
-        
-        # Move to child
-        node = child
-        depth += 1
-    
-    # Current node is the leaf, state is the leaf's state
-    leaf_state = state
-    
-    # Add the leaf node to the path (path now includes root to leaf, inclusive)
-    path.append(node)
-    
-    # Expansion / evaluation phase
-    if node.is_terminal:
-        # Leaf is already terminal, use stored terminal value
-        # terminal_value is from the POV of the player to move at the leaf (node.to_play)
-        leaf_value = node.terminal_value
-        if leaf_value is None:
-            # Fallback: compute from state
-            if hasattr(leaf_state, 'is_game_over') and leaf_state.is_game_over():
-                result = leaf_state.result() if hasattr(leaf_state, 'result') else "*"
-                if hasattr(leaf_state, 'is_checkmate') and leaf_state.is_checkmate():
-                    # Current player is mated: -1.0 from their POV
-                    leaf_value = -1.0
-                elif result in ("1-0", "0-1"):
-                    leaf_value = -1.0
+        # Expansion / evaluation phase
+        if node.is_terminal:
+            # Leaf is already terminal, use stored terminal value
+            leaf_value = node.terminal_value
+            if leaf_value is None:
+                # Fallback: compute from state
+                if hasattr(leaf_state, "is_game_over") and leaf_state.is_game_over():
+                    result = leaf_state.result() if hasattr(leaf_state, "result") else "*"
+                    if hasattr(leaf_state, "is_checkmate") and leaf_state.is_checkmate():
+                        # Current player is mated: -1.0 from their POV
+                        leaf_value = -1.0
+                    elif result in ("1-0", "0-1"):
+                        leaf_value = -1.0
+                    else:
+                        leaf_value = 0.0
                 else:
                     leaf_value = 0.0
-            else:
-                leaf_value = 0.0
-    else:
-        # Expand the leaf node
-        # expand_node returns value from the POV of the player to move at the leaf
-        leaf_value = expand_node(node, leaf_state, model, config, batch_evaluator)
-    
-    # Ensure we have a valid value
-    if leaf_value is None:
-        leaf_value = 0.0
-    
-    # Backup phase: propagate value back up the tree with POV sign flips
-    # 
-    # Value representation: All values are stored from the POV of the player to move at each node.
-    # The PolicyValueResNet returns v in [-1, 1] from the POV of the side to move in that position.
-    # 
-    # Backup pattern:
-    #   - leaf_value is from the POV of the leaf's side to move (node.to_play)
-    #   - As we back up, we flip the sign because the parent's value must be from the parent's POV
-    #   - Each node stores value_sum from its own POV (node.to_play)
-    #   - When backing up from child to parent: value = -value (flip for opponent's POV)
-    #
-    # Example: If leaf is white to move and value = +0.5 (white winning), then:
-    #   - Leaf node (white): stores +0.5
-    #   - Parent node (black): stores -0.5 (flipped, from black's POV)
-    #   - Grandparent (white): stores +0.5 (flipped again, from white's POV)
-    value = float(leaf_value)  # leaf_value is from POV of the leaf's side to move
-    
-    # path is a list of nodes from root to leaf, inclusive
-    # We iterate in reverse (from leaf up to root) to back up the value
-    for node_in_path in reversed(path):
-        # Update this node with the current value (which is from this node's POV)
-        node_in_path.visit_count += 1
-        node_in_path.value_sum += value  # value must be from POV of node_in_path.to_play
+        else:
+            # Expand the leaf node
+            leaf_value = expand_node(node, leaf_state, model, config, batch_evaluator)
         
-        # Flip the value because the next node up the tree is the opponent's POV
-        # (We don't flip after the last iteration, but that's fine - we're done)
-        value = -value
+        # Ensure we have a valid value
+        if leaf_value is None:
+            leaf_value = 0.0
+        
+        # Backup phase: propagate value back up the tree with POV sign flips
+        value = float(leaf_value)  # leaf_value is from POV of the leaf's side to move
+        
+        for node_in_path in reversed(path):
+            node_in_path.visit_count += 1
+            node_in_path.value_sum += value
+            value = -value
 
 
 def mcts_search(
@@ -1293,42 +1394,33 @@ def mcts_search(
     from .move_index import POLICY_SIZE, move_to_index, index_to_move
     import time
     
-    # Create initial config for root expansion (before blunder detection)
-    # We'll adjust n_sims after capturing root value
-    initial_config = SearchConfig(
-        n_simulations=config.n_simulations,
-        c_puct=config.c_puct,
-        dirichlet_alpha=config.dirichlet_alpha,
-        dirichlet_frac=config.dirichlet_frac,
-        max_depth=config.max_depth,
-        temperature=config.temperature,
-        use_dirichlet_noise=config.use_dirichlet_noise,
-        device=config.device,
-        min_policy_moves=config.min_policy_moves,
-        epsilon_prior=config.epsilon_prior,
-        tactical_bonus=config.tactical_bonus,
-        min_simulations=config.min_simulations,
-        max_simulations=config.max_simulations,
-        fast_mode=config.fast_mode,
-    )
-    
-    # Use provided root node or create new one
-    # Expand root and capture the root value from the network
+    # Initialize root node and capture root value
+    # All root evaluations go through batch_evaluator for caching
     if root_node is not None:
         root = root_node
         # If root is already expanded, we can reuse it
         if not root.is_expanded:
-            # Expand root and capture value
-            current_root_value = expand_node(root, root_state, model, initial_config)
+            # Expand root and capture value, using batch_evaluator so root eval is cached
+            current_root_value = expand_node(
+                root,
+                root_state,
+                model,
+                config,
+                batch_evaluator=batch_evaluator,
+            )
         else:
             # Root already expanded, get value from root's Q-value or evaluate
-            # If root has been visited, use Q-value; otherwise evaluate
+            # If root has been visited, use Q-value; otherwise evaluate with batch_evaluator
             if root.visit_count > 0:
                 current_root_value = root.q_value
             else:
-                # Evaluate root state to get current value
-                device = torch.device(initial_config.device) if isinstance(initial_config.device, str) else initial_config.device
-                _, current_root_value = evaluate_state_with_model(root_state, model, device)
+                device = torch.device(config.device) if isinstance(config.device, str) else config.device
+                _, current_root_value = evaluate_state_with_model(
+                    root_state,
+                    model,
+                    device,
+                    batch_evaluator=batch_evaluator,
+                )
     else:
         # Determine to_play from root_state
         to_play = 1  # Default to white
@@ -1350,7 +1442,13 @@ def mcts_search(
         
         # Immediately expand the root and capture the root value
         # expand_node returns the value from the network (from POV of side to move)
-        current_root_value = expand_node(root, root_state, model, initial_config)
+        current_root_value = expand_node(
+            root,
+            root_state,
+            model,
+            config,
+            batch_evaluator=batch_evaluator,
+        )
     
     # BLUNDER-SENSITIVE SIMULATION BUDGET
     # When eval jumps up a lot, we suspect a blunder and invest more search there.
@@ -1380,29 +1478,14 @@ def mcts_search(
     # Clamp to min/max bounds
     n_sims = max(config.min_simulations, min(n_sims, config.max_simulations))
     
-    # Adjust max_depth in fast mode if needed
+    # Adjust max_depth in fast mode if needed (micro-optimization: use local variable instead of rebuilding config)
     effective_max_depth = config.max_depth
     if config.fast_mode and config.max_depth is not None:
         # Reduce depth by ~30% in fast mode for speed
         effective_max_depth = int(config.max_depth * 0.7)
     
-    # Create effective config with adjusted parameters
-    effective_config = SearchConfig(
-        n_simulations=n_sims,
-        c_puct=config.c_puct,
-        dirichlet_alpha=config.dirichlet_alpha,
-        dirichlet_frac=config.dirichlet_frac,
-        max_depth=effective_max_depth,
-        temperature=config.temperature,
-        use_dirichlet_noise=config.use_dirichlet_noise,
-        device=config.device,
-        min_policy_moves=config.min_policy_moves,
-        epsilon_prior=config.epsilon_prior,
-        tactical_bonus=config.tactical_bonus,
-        min_simulations=config.min_simulations,
-        max_simulations=config.max_simulations,
-        fast_mode=config.fast_mode,
-    )
+    # Use config directly instead of creating new SearchConfig object (micro-optimization)
+    # Only effective_max_depth differs from config.max_depth, pass it as override to run_simulation
     
     # Check if root is terminal (checkmate, stalemate, etc.)
     if root.is_terminal:
@@ -1438,18 +1521,25 @@ def mcts_search(
     # Use provided batch evaluator or create a new one if not provided
     # (SearchTree provides one for cross-search caching)
     if batch_evaluator is None:
-        device = torch.device(effective_config.device) if isinstance(effective_config.device, str) else effective_config.device
-        # Better batch size heuristic: larger batches for GPU
+        device = torch.device(config.device) if isinstance(config.device, str) else config.device
+        # Optimized batch size heuristic: larger batches for better GPU utilization
+        # Larger batches = better GPU efficiency, less overhead
         if device.type == "cuda":
-            batch_size = min(64, max(8, n_sims // 2))  # GPU: prefer larger batches
+            # Use larger batches for GPU: up to 128 for better throughput
+            # More aggressive batching = fewer kernel launches = faster
+            batch_size = min(128, max(16, n_sims // 2))
         else:
-            batch_size = min(16, max(4, n_sims // 4))  # CPU: smaller is okay
+            batch_size = min(32, max(4, n_sims // 4))  # CPU: moderate batches
         batch_evaluator = BatchEvaluator(model, device, batch_size=batch_size)
     
     # Run simulations with batch inference
     # Batching happens automatically in evaluate_state_with_model when should_eval_now() is true
-    # We only need to flush remaining states at the end
+    # We periodically flush batches during search for better GPU utilization
     start_time = time.time() if available_time_ms is not None else None
+    
+    # Batch flush interval: evaluate batches every N simulations for better throughput
+    # This ensures we don't wait too long before batching, improving GPU utilization
+    batch_flush_interval = max(1, batch_evaluator.batch_size // 4) if batch_evaluator else 16
     
     for sim_idx in range(n_sims):
         # Check time budget if provided (basic implementation)
@@ -1459,21 +1549,25 @@ def mcts_search(
                 # Time budget exhausted
                 break
         
-        run_simulation(root, root_state, model, effective_config, batch_evaluator)
+        run_simulation(root, root_state, model, config, batch_evaluator, max_depth_override=effective_max_depth)
+        
+        # Periodically flush batches during search for better GPU utilization
+        # This reduces latency and improves throughput
+        if batch_evaluator is not None and (sim_idx + 1) % batch_flush_interval == 0:
+            batch_evaluator.evaluate_batch()
     
     # Final batch evaluation to flush any remaining pending states
-    # (Most batching happens automatically in evaluate_state_with_model)
     if batch_evaluator is not None:
-        # Check if there are pending states (thread-safe)
         batch_evaluator.evaluate_batch()  # This is safe to call even if empty
     
-    # Log batch evaluation statistics
-    stats = batch_evaluator.get_stats()
-    if stats['total'] > 0:
-        batched_pct = (stats['batched'] / stats['total']) * 100
-        cached_pct = (stats['cached'] / stats['total']) * 100
-        print(f"Batch inference stats: {stats['batched']} batched ({batched_pct:.1f}%), "
-              f"{stats['cached']} cached ({cached_pct:.1f}%), {stats['single']} single")
+    # Log batch evaluation statistics (only in verbose mode to avoid overhead)
+    # Commented out for performance - uncomment if you need to debug batching
+    # stats = batch_evaluator.get_stats()
+    # if stats['total'] > 0:
+    #     batched_pct = (stats['batched'] / stats['total']) * 100
+    #     cached_pct = (stats['cached'] / stats['total']) * 100
+    #     print(f"Batch inference stats: {stats['batched']} batched ({batched_pct:.1f}%), "
+    #           f"{stats['cached']} cached ({cached_pct:.1f}%), {stats['single']} single")
     
     # Move selection at root with policy-aware blending
     # Collect visit counts for root children
@@ -1497,7 +1591,7 @@ def mcts_search(
     # Recompute policy logits for root state to get fresh policy distribution
     # This ensures we have the original network policy (not affected by Dirichlet noise)
     from .encoding import legal_mask_4672
-    device = torch.device(effective_config.device) if isinstance(effective_config.device, str) else effective_config.device
+    device = torch.device(config.device) if isinstance(config.device, str) else config.device
     # Pass batch_evaluator to reuse cached result (root was already evaluated during expansion)
     policy_logits, _ = evaluate_state_with_model(root_state, model, device, batch_evaluator)
     
@@ -1563,7 +1657,7 @@ def mcts_search(
     # Move selection based on temperature
     combined_np = combined.numpy()
     
-    if effective_config.temperature < 1e-3:
+    if config.temperature < 1e-3:
         # Deterministic: pick argmax of combined, but keep the full combined
         best_idx = int(combined_np.argmax().item())
         chosen_move = moves[best_idx]
@@ -1586,7 +1680,7 @@ def mcts_search(
             chosen_move = moves[best_idx]
     else:
         # Apply temperature to combined distribution
-        temp = effective_config.temperature
+        temp = config.temperature
         # Use log-space to avoid overflow
         log_combined = np.array([math.log(max(1e-10, float(c))) for c in combined_np])
         log_powered = log_combined / temp
@@ -1690,4 +1784,3 @@ def debug_root_stats(root: SearchNode, root_state: GameState, model: nn.Module, 
     print("Top moves by policy:")
     for move, n, q, p in rows[:top_k]:
         print(f"  {move}: N={n}, Q={q:.3f}, P={p:.3f}")
-

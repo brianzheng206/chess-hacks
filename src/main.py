@@ -35,12 +35,25 @@ MODEL_PATH = str(REPO_ROOT / "stockfish_949.pt")
 OPENING_BOOK_PATH = str(REPO_ROOT / "opening_book.pkl") if (REPO_ROOT / "opening_book.pkl").exists() else None
 
 # Early termination constants for value-based decision skipping
-VALUE_EARLY_TERMINATION_THRESHOLD = 0.85  # abs(value) above this → skip PUCT (lowered for speed)
-VALUE_EARLY_TERMINATION_MIN_PLY = 4       # don't early-terminate in the first few plies
+VALUE_EARLY_TERMINATION_THRESHOLD = 0.70  # abs(value) above this → skip PUCT (aggressive for bullet)
+VALUE_EARLY_TERMINATION_MIN_PLY = 2       # allow earlier termination (was 4)
 
 # Debug flags - set to True only when debugging (significantly impacts performance)
 DEBUG_POLICY = False  # Enable verbose policy extraction and diagnostics
 DEBUG_TENSOR = False  # Enable raw tensor diagnostics
+
+# Verbose output flag - set via environment variable or keep False for bullet games
+VERBOSE = os.getenv("VERBOSE", "False").lower() in ("true", "1", "yes")
+
+# Pure policy bullet mode - skips MCTS entirely, just uses neural network policy
+# Set via environment variable or keep False for normal play
+PURE_POLICY_BULLET = os.getenv("PURE_POLICY_BULLET", "False").lower() in ("true", "1", "yes")
+
+# Hybrid mode: use pure policy when time is low or game is advanced
+# Set via environment variable, defaults to True if PURE_POLICY_BULLET is enabled
+USE_HYBRID_MODE = os.getenv("USE_HYBRID_MODE", str(PURE_POLICY_BULLET)).lower() in ("true", "1", "yes")
+HYBRID_TIME_THRESHOLD_MS = 30000  # Use pure policy when timeLeft < 30 seconds
+HYBRID_PLY_THRESHOLD = 20  # Use pure policy when ply > 20
 
 # Opening book optimization flags
 OPENING_COMPARE_WITH_MCTS = False  # Enable MCTS comparison between model move and opening book (slower but more accurate)
@@ -143,8 +156,8 @@ if model is not None:
         engine = UciEngine(
             model,
             use_puct=True,
-            sims=120,  # Reduced from 175 for faster moves (will be adjusted by time management)
-            c_puct=0.55,  # Reduced from 0.7 to trust policy more, faster convergence
+            sims=40,  # Reduced from 120 for bullet/1-minute games (will be adjusted by time management)
+            c_puct=0.5,  # Reduced from 0.55 to trust policy more, faster convergence
             device=device,
             opening_book_path=OPENING_BOOK_PATH,
             opening_max_ply=8,
@@ -259,8 +272,8 @@ def value_to_sims_scale(value: float) -> float:
     elif abs_value >= 0.85:  # Very winning/losing (but winning)
         scale = 0.15  # Very aggressive for clearly winning positions
     else:
-        # Linear mapping: abs_value 0.0 → scale 1.0, abs_value 0.85 → scale ~0.32
-        scale = 1.0 - 0.8 * abs_value
+        # Linear mapping: abs_value 0.0 → scale 1.0, abs_value 0.85 → scale ~0.065 (bullet: shrink harder)
+        scale = 1.0 - 1.1 * abs_value
     
     # Clamp to [0.15, 1.0] to ensure reasonable bounds
     return max(0.15, min(1.0, scale))
@@ -304,7 +317,8 @@ def test_func(ctx: GameContext):
     # This gets called every time the model needs to make a move
     # Return a python-chess Move object that is a legal move for the current position
 
-    print("Cooking move with chess engine...")
+    if VERBOSE:
+        print("Cooking move with chess engine...")
     
     legal_moves = list(ctx.board.generate_legal_moves())
     if not legal_moves:
@@ -383,16 +397,18 @@ def test_func(ctx: GameContext):
                 sample=False
             )
             nn_time = (time.monotonic() - nn_start) * 1000
-            if nn_time > 10:  # Only print if it's significant
-                print(f"NN forward (root): {nn_time:.1f} ms")
-            
-            # Log the neural network value evaluation (side to move perspective)
-            if value is not None:
-                print(format_value_eval(float(value)))
+            if VERBOSE:
+                if nn_time > 10:  # Only print if it's significant
+                    print(f"NN forward (root): {nn_time:.1f} ms")
+                
+                # Log the neural network value evaluation (side to move perspective)
+                if value is not None:
+                    print(format_value_eval(float(value)))
             
             # Ensure we got a valid move
             if policy_move is None or policy_move not in legal_moves:
-                print("Warning: choose_move returned invalid move, using first legal move")
+                if VERBOSE:
+                    print("Warning: choose_move returned invalid move, using first legal move")
                 policy_move = legal_move_list[0]
             
             # Convert probabilities tensor to dictionary of Move -> probability for logging
@@ -503,8 +519,8 @@ def test_func(ctx: GameContext):
                 # Create empty sorted_moves for compatibility
                 sorted_moves = []
             
-            # policy_move from choose_move is the model's actual argmax - this is what we use for selection
-            if policy_move is not None:
+                # policy_move from choose_move is the model's actual argmax - this is what we use for selection
+            if policy_move is not None and VERBOSE:
                 policy_prob = move_probs.get(policy_move, 0.0) if move_probs else 0.0
                 print(f"Using policy_move (model's argmax): {policy_move.uci()} (prob={policy_prob:.4f})")
         except Exception as e:
@@ -524,6 +540,41 @@ def test_func(ctx: GameContext):
             policy_move = legal_move_list[0]
     
     # ------------------------------
+    # PURE POLICY BULLET MODE (skip MCTS entirely for maximum speed)
+    # ------------------------------
+    # Check if we should use pure policy mode (no MCTS at all)
+    use_pure_policy = False
+    if PURE_POLICY_BULLET:
+        if USE_HYBRID_MODE:
+            # Hybrid mode: use pure policy when time is low or game is advanced
+            movetime_ms = ctx.timeLeft if ctx.timeLeft and ctx.timeLeft > 0 else 0
+            if movetime_ms > 0 and movetime_ms < HYBRID_TIME_THRESHOLD_MS:
+                use_pure_policy = True
+                if VERBOSE:
+                    print(f"Pure policy mode (hybrid): timeLeft={movetime_ms:.0f}ms < {HYBRID_TIME_THRESHOLD_MS}ms")
+            elif current_ply > HYBRID_PLY_THRESHOLD:
+                use_pure_policy = True
+                if VERBOSE:
+                    print(f"Pure policy mode (hybrid): ply={current_ply} > {HYBRID_PLY_THRESHOLD}")
+        else:
+            # Always use pure policy
+            use_pure_policy = True
+            if VERBOSE:
+                print("Pure policy mode (always)")
+    
+    if use_pure_policy:
+        # Just trust the net, no MCTS at all - fastest possible mode
+        move = policy_move if policy_move is not None and policy_move in legal_moves else legal_move_list[0]
+        if VERBOSE:
+            print(f"Pure policy move: {move.uci()}")
+        # Log probabilities if available
+        if move_probs:
+            ctx.logProbabilities(move_probs)
+        else:
+            ctx.logProbabilities({move: 1.0})
+        return move
+    
+    # ------------------------------
     # EARLY TERMINATION CHECK (based on NN value and policy confidence)
     # ------------------------------
     # NEW: Check if position is "decided" based on extreme value magnitude
@@ -536,15 +587,17 @@ def test_func(ctx: GameContext):
     num_check_moves = sum(1 for m in legal_move_list if ctx.board.gives_check(m))
     in_check = ctx.board.is_check()
     
-    print(f"Checks available: {num_check_moves}; in_check={in_check}")
+    if VERBOSE:
+        print(f"Checks available: {num_check_moves}; in_check={in_check}")
     
     # Policy confidence check: if top policy move has very high probability, skip MCTS
     if move_probs and policy_move is not None:
         top_policy_prob = move_probs.get(policy_move, 0.0)
-        # If top move has >50% probability and no tactical complexity, trust policy
-        if top_policy_prob > 0.50 and not in_check and num_check_moves < 2:
+        # If top move has >40% probability and no tactical complexity, trust policy (aggressive for bullet)
+        if top_policy_prob > 0.40 and not in_check and num_check_moves < 2:
             policy_confidence_skip = True
-            print(f"Policy confidence skip: top move has {top_policy_prob*100:.1f}% probability")
+            if VERBOSE:
+                print(f"Policy confidence skip: top move has {top_policy_prob*100:.1f}% probability")
     
     # Early termination conditions:
     # 1. Value must be available
@@ -556,8 +609,9 @@ def test_func(ctx: GameContext):
         if abs(float(value)) >= VALUE_EARLY_TERMINATION_THRESHOLD:
             if not in_check and num_check_moves < 3:
                 early_termination = True
-                print(f"Early termination triggered (value={float(value):+.3f})")
-            else:
+                if VERBOSE:
+                    print(f"Early termination triggered (value={float(value):+.3f})")
+            elif VERBOSE:
                 print("Skipping early termination due to tactical complexity")
     
     # ------------------------------
@@ -603,36 +657,39 @@ def test_func(ctx: GameContext):
         time_budget_ms = time_per_move_ms * 0.75
         estimated_sims = max(15, int(time_budget_ms * sims_per_sec / 1000.0))
         
-        # Cap simulations based on time remaining (aggressively optimized for speed)
+        # Cap simulations based on time remaining (optimized for bullet/1-minute games)
         if movetime_ms > 40000:  # >40 seconds left (early game)
-            max_sims = 90  # Reduced from 120
+            max_sims = 60  # Reduced from 90 for bullet
         elif movetime_ms > 25000:  # 25-40 seconds
-            max_sims = 75  # Reduced from 100
+            max_sims = 45  # Reduced from 75 for bullet
         elif movetime_ms > 15000:  # 15-25 seconds
-            max_sims = 60  # Reduced from 80
+            max_sims = 35  # Reduced from 60 for bullet
         elif movetime_ms > 8000:  # 8-15 seconds
-            max_sims = 45  # Reduced from 65
+            max_sims = 28  # Reduced from 45 for bullet
         elif movetime_ms > 4000:  # 4-8 seconds
-            max_sims = 35  # Reduced from 50
+            max_sims = 22  # Reduced from 35 for bullet
         elif movetime_ms > 2000:  # 2-4 seconds
-            max_sims = 25  # Reduced from 35
+            max_sims = 16  # Reduced from 25 for bullet
         else:  # <2 seconds: critical time
-            max_sims = 15  # Reduced from 20
+            max_sims = 10  # Reduced from 15 for bullet
         
         sims = min(estimated_sims, max_sims)
         
-        # Additional time pressure handling (optimized for speed)
+        # Additional time pressure handling (optimized for bullet/1-minute games)
         if movetime_ms < 15000:  # Less than 15 seconds
-            sims = min(sims, 65)  # Reduced from 80
+            sims = min(sims, 40)  # Reduced from 65 for bullet
         if movetime_ms < 8000:  # Less than 8 seconds
-            sims = min(sims, 45)  # Reduced from 50
+            sims = min(sims, 28)  # Reduced from 45 for bullet
         if movetime_ms < 4000:  # Less than 4 seconds
-            sims = min(sims, 30)  # Reduced from 35
+            sims = min(sims, 20)  # Reduced from 30 for bullet
         if movetime_ms < 2000:  # Less than 2 seconds
-            sims = min(sims, 18)  # Reduced from 20
+            sims = min(sims, 12)  # Reduced from 18 for bullet
+        
+        # Absolute global cap for bullet/1-minute games
+        sims = min(sims, 50)
     else:
         # No time info available - use conservative defaults
-        sims = min(sims, 80)  # Safe cap when time info unavailable
+        sims = min(sims, 50)  # Reduced from 80 for bullet
     
     # Phase-aware adjustments (optimized for speed while maintaining accuracy)
     # Strategy: Trust policy more, reduce search in all phases for faster moves
@@ -694,18 +751,19 @@ def test_func(ctx: GameContext):
         value_float = float(value)
         abs_value = abs(float(value))
         
-        # More aggressive minimums for losing/winning positions
+        # More aggressive minimums for losing/winning positions (bullet-optimized)
         if abs_value >= 0.85:
-            min_sims = 8  # Very winning/losing - minimal search
+            min_sims = 4  # Very winning/losing - minimal search (reduced from 8 for bullet)
         elif value_float < -0.3:  # Losing position
-            min_sims = 8  # Losing - very minimal search (same as very winning/losing)
+            min_sims = 4  # Losing - very minimal search (reduced from 8 for bullet)
         elif abs_value >= 0.5:
-            min_sims = 10  # Moderately winning/losing
+            min_sims = 6  # Moderately winning/losing (reduced from 10 for bullet)
         else:
-            min_sims = 12  # Unclear positions
+            min_sims = 8  # Unclear positions (reduced from 12 for bullet)
         
         sims = max(min_sims, int(sims * scale))
-        print(f"Value-aware sims scaling: value={value_float:+.3f}, scale={scale:.2f}, sims {sims_before} → {sims}")
+        if VERBOSE:
+            print(f"Value-aware sims scaling: value={value_float:+.3f}, scale={scale:.2f}, sims {sims_before} → {sims}")
     
     # ------------------------------
     # STEP 3: SELECTION STRATEGY (using UCI engine logic)
@@ -741,8 +799,9 @@ def test_func(ctx: GameContext):
                 # Found a tactical opportunity - use it instead of opening book
                 decision_mode = "Tactical opportunity"
                 move = tactical_move
-                print(f"Decision mode: {decision_mode} (opening, ply {current_ply})")
-                print(f"Using tactical move: {move.uci()}")
+                if VERBOSE:
+                    print(f"Decision mode: {decision_mode} (opening, ply {current_ply})")
+                    print(f"Using tactical move: {move.uci()}")
                 # Track position after move
                 test_board = ctx.board.copy()
                 test_board.push(tactical_move)
@@ -759,8 +818,9 @@ def test_func(ctx: GameContext):
             if skip_nn_eval:
                 decision_mode = "Opening book (fast)"
                 move = mv
-                print(f"Decision mode: {decision_mode} (ply {current_ply})")
-                print(f"Using opening book move: {move.uci()}")
+                if VERBOSE:
+                    print(f"Decision mode: {decision_mode} (ply {current_ply})")
+                    print(f"Using opening book move: {move.uci()}")
                 
                 # Create simple move_probs for logging
                 move_probs = {move: 1.0}
@@ -820,8 +880,9 @@ def test_func(ctx: GameContext):
                     if value_model > value_book - 0.1 or top_model_prob > 0.4:
                         decision_mode = "Model override (high confidence)"
                         move = top_model_move
-                        print(f"Decision mode: {decision_mode} (opening, ply {current_ply})")
-                        print(f"Model confident ({top_model_prob*100:.1f}%) in {top_model_move.uci()} (value {value_model:.3f}), overriding opening book {mv.uci()} (value {value_book:.3f})")
+                        if VERBOSE:
+                            print(f"Decision mode: {decision_mode} (opening, ply {current_ply})")
+                            print(f"Model confident ({top_model_prob*100:.1f}%) in {top_model_move.uci()} (value {value_model:.3f}), overriding opening book {mv.uci()} (value {value_book:.3f})")
                         # Track position after move
                         test_board = ctx.board.copy()
                         test_board.push(move)
@@ -833,8 +894,9 @@ def test_func(ctx: GameContext):
                     # Very high confidence, use it even without PUCT
                     decision_mode = "Model override (very high confidence)"
                     move = top_model_move
-                    print(f"Decision mode: {decision_mode} (opening, ply {current_ply})")
-                    print(f"Model very confident ({top_model_prob*100:.1f}%) in {top_model_move.uci()}, overriding opening book {mv.uci()}")
+                    if VERBOSE:
+                        print(f"Decision mode: {decision_mode} (opening, ply {current_ply})")
+                        print(f"Model very confident ({top_model_prob*100:.1f}%) in {top_model_move.uci()}, overriding opening book {mv.uci()}")
                     # Track position after move
                     test_board = ctx.board.copy()
                     test_board.push(move)
@@ -891,16 +953,19 @@ def test_func(ctx: GameContext):
                     if value_search > value_book + threshold:
                         mv = search_move
                         decision_mode = "Opening book (PUCT override)"
-                        print(f"Decision mode: {decision_mode} (opening, ply {current_ply})")
-                        print(f"PUCT found better move: {search_move.uci()} (value {value_search:.3f} vs book {value_book:.3f})")
+                        if VERBOSE:
+                            print(f"Decision mode: {decision_mode} (opening, ply {current_ply})")
+                            print(f"PUCT found better move: {search_move.uci()} (value {value_search:.3f} vs book {value_book:.3f})")
                     else:
                         decision_mode = "Opening book"
-                        print(f"Decision mode: {decision_mode} (opening, ply {current_ply})")
-                        print(f"Using opening book move: {mv.uci()} (value {value_book:.3f} vs PUCT {value_search:.3f})")
+                        if VERBOSE:
+                            print(f"Decision mode: {decision_mode} (opening, ply {current_ply})")
+                            print(f"Using opening book move: {mv.uci()} (value {value_book:.3f} vs PUCT {value_search:.3f})")
                 else:
                     decision_mode = "Opening book"
-                    print(f"Decision mode: {decision_mode} (opening, ply {current_ply})")
-                    print(f"Using opening book move: {mv.uci()}")
+                    if VERBOSE:
+                        print(f"Decision mode: {decision_mode} (opening, ply {current_ply})")
+                        print(f"Using opening book move: {mv.uci()}")
             
             move = mv
             # Track position after opening move
@@ -923,26 +988,35 @@ def test_func(ctx: GameContext):
         if force_greedy:
             if critical_time:
                 decision_mode = "Greedy policy (critical time)"
-                print(f"Decision mode: {decision_mode} (movetime_ms={movetime_ms:.0f}ms, ply {current_ply})")
+                if VERBOSE:
+                    print(f"Decision mode: {decision_mode} (movetime_ms={movetime_ms:.0f}ms, ply {current_ply})")
             elif losing_badly:
                 decision_mode = "Greedy policy (losing badly)"
-                print(f"Decision mode: {decision_mode} (value={float(value):+.3f}, ply {current_ply})")
+                if VERBOSE:
+                    print(f"Decision mode: {decision_mode} (value={float(value):+.3f}, ply {current_ply})")
             
-            # Use greedy policy - just take the model's top move
-            try:
-                mv, _, _ = choose_move(ctx.board, model, device=device, temperature=0.8, sample=False)
-                move = mv
-                print(f"Using greedy policy move: {move.uci()}")
-            except Exception as e:
-                # Fallback if choose_move fails
-                print(f"info string Error in greedy selection: {e}", file=sys.stderr)
-                # Fallback to policy_move or first legal move
-                if policy_move is not None and policy_move in legal_moves:
-                    move = policy_move
-                    print(f"Fallback to policy_move: {move.uci()}")
-                else:
-                    move = legal_move_list[0]
-                    print(f"Fallback to first legal move: {move.uci()}")
+            # If we already did NN eval, just use it (avoids redundant choose_move call)
+            if not skip_nn_eval and policy_move is not None and policy_move in legal_moves:
+                move = policy_move
+                if VERBOSE:
+                    print(f"Using cached policy_move: {move.uci()}")
+            else:
+                # Only in very early opening (skip_nn_eval) do we actually need a fresh call
+                try:
+                    mv, _, _ = choose_move(ctx.board, model, device=device, temperature=0.8, sample=False)
+                    move = mv
+                    if VERBOSE:
+                        print(f"Using greedy policy move: {move.uci()}")
+                except Exception as e:
+                    # Fallback if choose_move fails
+                    print(f"info string Error in greedy selection: {e}", file=sys.stderr)
+                    # Fallback to policy_move or first legal move
+                    if policy_move is not None and policy_move in legal_moves:
+                        move = policy_move
+                        print(f"Fallback to policy_move: {move.uci()}")
+                    else:
+                        move = legal_move_list[0]
+                        print(f"Fallback to first legal move: {move.uci()}")
         # NEW: Skip PUCT if early termination is triggered (extreme value magnitude)
         # NEW: Skip MCTS if policy is very confident (policy_confidence_skip)
         # NEW: Skip MCTS if low on time (use greedy policy for speed)
@@ -975,7 +1049,8 @@ def test_func(ctx: GameContext):
             search_start = time.monotonic()
             mv, visit_dist, root_value = engine.search_tree.search(max_simulations_override=sims)
             search_time = (time.monotonic() - search_start) * 1000
-            print(f"Search: {search_time:.1f} ms (sims={sims})")
+            if VERBOSE:
+                print(f"Search: {search_time:.1f} ms (sims={sims})")
             
             # Policy trust check: if top policy move has much higher probability than MCTS choice,
             # and MCTS choice has low policy probability, trust the policy instead
@@ -999,9 +1074,10 @@ def test_func(ctx: GameContext):
                         ratio_str = f"{ratio:.1f}x higher"
                     else:
                         ratio_str = "infinitely higher (MCTS prob=0)"
-                    print(f"Policy trust override: MCTS chose {mv.uci()} (prob={mcts_policy_prob:.4f}), "
-                          f"but policy top move {policy_move.uci()} has prob={top_policy_prob:.4f} "
-                          f"({ratio_str}). Using policy move.")
+                    if VERBOSE:
+                        print(f"Policy trust override: MCTS chose {mv.uci()} (prob={mcts_policy_prob:.4f}), "
+                              f"but policy top move {policy_move.uci()} has prob={top_policy_prob:.4f} "
+                              f"({ratio_str}). Using policy move.")
                     mv = policy_move
                     decision_mode = "Policy trust override"
             
@@ -1017,7 +1093,7 @@ def test_func(ctx: GameContext):
                     mv, _, _ = engine.search_tree.search(max_simulations_override=sims * 2)
             
             # Log root value prediction (from current player's perspective)
-            if hasattr(engine.search_tree, 'root') and engine.search_tree.root.visit_count > 0:
+            if VERBOSE and hasattr(engine.search_tree, 'root') and engine.search_tree.root.visit_count > 0:
                 v = engine.search_tree.root.q_value
                 print(f"info string root_value {v:.3f}")
             
@@ -1038,41 +1114,60 @@ def test_func(ctx: GameContext):
             if early_termination or policy_confidence_skip:
                 if early_termination:
                     decision_mode = "Greedy policy (early termination)"
-                    print(f"Decision mode: {decision_mode} (value={float(value):+.3f}, ply {current_ply})")
+                    if VERBOSE:
+                        print(f"Decision mode: {decision_mode} (value={float(value):+.3f}, ply {current_ply})")
                 else:
                     decision_mode = "Greedy policy (high confidence)"
-                    top_prob = move_probs.get(policy_move, 0.0) if move_probs else 0.0
-                    print(f"Decision mode: {decision_mode} (top prob={top_prob*100:.1f}%, ply {current_ply})")
+                    if VERBOSE:
+                        top_prob = move_probs.get(policy_move, 0.0) if move_probs else 0.0
+                        print(f"Decision mode: {decision_mode} (top prob={top_prob*100:.1f}%, ply {current_ply})")
                 # Prefer sorted_moves[0][0] if available, otherwise fallback to policy_move
                 if sorted_moves and len(sorted_moves) > 0:
                     move = sorted_moves[0][0]
-                    print(f"Using top policy move from sorted_moves: {move.uci()}")
+                    if VERBOSE:
+                        print(f"Using top policy move from sorted_moves: {move.uci()}")
                 elif policy_move is not None and policy_move in legal_moves:
                     move = policy_move
-                    print(f"Using policy_move: {move.uci()}")
+                    if VERBOSE:
+                        print(f"Using policy_move: {move.uci()}")
                 else:
                     move = legal_move_list[0]
-                    print(f"Fallback to first legal move: {move.uci()}")
+                    if VERBOSE:
+                        print(f"Fallback to first legal move: {move.uci()}")
             elif skip_mcts_for_time:
                 decision_mode = "Greedy policy (low time)"
-                print(f"Decision mode: {decision_mode} (movetime_ms={movetime_ms}, ply {current_ply})")
-                try:
-                    mv, _, _ = choose_move(ctx.board, model, device=device, temperature=0.8, sample=False)
-                    move = mv
-                except Exception as e:
-                    # Fallback if choose_move fails
-                    print(f"info string Error in greedy selection: {e}", file=sys.stderr)
-                    move = next(iter(ctx.board.legal_moves), None)
+                if VERBOSE:
+                    print(f"Decision mode: {decision_mode} (movetime_ms={movetime_ms}, ply {current_ply})")
+                # If we already did NN eval, just use it (avoids redundant choose_move call)
+                if not skip_nn_eval and policy_move is not None and policy_move in legal_moves:
+                    move = policy_move
+                    if VERBOSE:
+                        print(f"Using cached policy_move: {move.uci()}")
+                else:
+                    try:
+                        mv, _, _ = choose_move(ctx.board, model, device=device, temperature=0.8, sample=False)
+                        move = mv
+                    except Exception as e:
+                        # Fallback if choose_move fails
+                        print(f"info string Error in greedy selection: {e}", file=sys.stderr)
+                        move = next(iter(ctx.board.legal_moves), None)
             else:
                 decision_mode = "Greedy policy"
-                print(f"Decision mode: {decision_mode} (ply {current_ply})")
-                try:
-                    mv, _, _ = choose_move(ctx.board, model, device=device, temperature=0.8, sample=False)
-                    move = mv
-                except Exception as e:
-                    # Fallback if choose_move fails
-                    print(f"info string Error in greedy selection: {e}", file=sys.stderr)
-                    move = next(iter(ctx.board.legal_moves), None)
+                if VERBOSE:
+                    print(f"Decision mode: {decision_mode} (ply {current_ply})")
+                # If we already did NN eval, just use it (avoids redundant choose_move call)
+                if not skip_nn_eval and policy_move is not None and policy_move in legal_moves:
+                    move = policy_move
+                    if VERBOSE:
+                        print(f"Using cached policy_move: {move.uci()}")
+                else:
+                    try:
+                        mv, _, _ = choose_move(ctx.board, model, device=device, temperature=0.8, sample=False)
+                        move = mv
+                    except Exception as e:
+                        # Fallback if choose_move fails
+                        print(f"info string Error in greedy selection: {e}", file=sys.stderr)
+                        move = next(iter(ctx.board.legal_moves), None)
         
         # Fallback if selected move is invalid
         if move is None or move not in legal_moves:
@@ -1097,17 +1192,18 @@ def test_func(ctx: GameContext):
                 engine._recent_positions.pop(0)
         
         # Final logging
-        print(f"Final decision mode: {decision_mode}")
-        print(f"Selected move: {move.uci()}")
-        
-        # Log position assessment using NN value
-        if value is not None:
-            print("Position assessment:", format_value_eval(float(value)))
-        
-        # Log probability for debugging (from our extracted move_probs, which is best-effort)
-        if move_probs and move in move_probs:
-            move_prob = move_probs[move]
-            print(f"Move probability (from extracted probs): {move_prob:.4f} ({move_prob*100:.2f}%)")
+        if VERBOSE:
+            print(f"Final decision mode: {decision_mode}")
+            print(f"Selected move: {move.uci()}")
+            
+            # Log position assessment using NN value
+            if value is not None:
+                print("Position assessment:", format_value_eval(float(value)))
+            
+            # Log probability for debugging (from our extracted move_probs, which is best-effort)
+            if move_probs and move in move_probs:
+                move_prob = move_probs[move]
+                print(f"Move probability (from extracted probs): {move_prob:.4f} ({move_prob*100:.2f}%)")
         
         return move
         
