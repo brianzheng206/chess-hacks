@@ -56,7 +56,7 @@ def _encode_board_for_model(board: chess.Board, model, device: str) -> torch.Ten
     return torch.from_numpy(x_np).unsqueeze(0).to(device)
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def policy_logits(model, board: chess.Board, device: Optional[str] = None) -> torch.Tensor:
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
@@ -96,7 +96,7 @@ def probs_from_logits(logits: torch.Tensor, temperature: float = 1.0) -> torch.T
     return F.softmax(logits / temperature, dim=-1)
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def choose_move(
     board: chess.Board,
     model,
@@ -182,7 +182,7 @@ def choose_move(
     return mv, probs.detach().cpu(), v_out
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def pick_move(
     model,
     board: chess.Board,

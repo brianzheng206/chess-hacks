@@ -223,6 +223,8 @@ class SearchNode:
         - Thread-safe children dictionary access
         - See BatchEvaluator docstring for more details on parallel MCTS requirements.
     """
+    __slots__ = ('parent', 'children', 'prior', 'visit_count', 'value_sum', 'state', 
+                 'is_expanded', 'is_terminal', 'terminal_value', 'to_play')
     
     def __init__(
         self,
@@ -692,7 +694,7 @@ class BatchEvaluator:
             
             # Run model on batch (all on GPU)
             self.model.eval()
-            with torch.no_grad():
+            with torch.inference_mode():
                 output = self.model(x)
                 logits_batch, v_pred_batch = unpack_policy(output)
                 
@@ -773,12 +775,12 @@ class BatchEvaluator:
         Thread-safe: Uses lock to prevent race conditions.
         
         Returns:
-            True if batch is full or has at least 2 states (for better GPU utilization), False otherwise.
-            Lower threshold (2 instead of 4) to batch more aggressively and reduce single evaluations.
+            True if batch is full or has at least 1 state (for better GPU utilization), False otherwise.
+            Very aggressive threshold (1) to batch immediately and reduce single evaluations.
         """
         with self._lock:
             pending_count = len(self.pending_states)
-            return pending_count >= self.batch_size or pending_count >= 2
+            return pending_count >= self.batch_size or pending_count >= 1
     
     def _cache_result(self, state: GameState, logits: torch.Tensor, value: float, is_single: bool = False) -> None:
         """Cache a result for a state.
@@ -884,7 +886,7 @@ def evaluate_state_with_model(
     
     # Run model
     model.eval()
-    with torch.no_grad():
+    with torch.inference_mode():
         output = model(x)
         logits_b, v_pred = unpack_policy(output)
         

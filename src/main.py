@@ -114,6 +114,15 @@ except Exception as e:
 # Performance optimizations: set model to eval mode and disable gradients
 if model is not None:
     model.eval()
+    # Compile model for faster inference (PyTorch 2.0+)
+    try:
+        if hasattr(torch, 'compile'):
+            print("Compiling model with torch.compile() for faster inference...")
+            model = torch.compile(model, mode='reduce-overhead')
+            print("Model compiled successfully")
+    except Exception as e:
+        print(f"Warning: torch.compile() failed (may not be available): {e}")
+        print("Continuing without compilation - this is fine for older PyTorch versions")
 torch.set_grad_enabled(False)
 
 # Note: Warm-up is skipped to allow server to start quickly
@@ -515,17 +524,27 @@ def test_func(ctx: GameContext):
             policy_move = legal_move_list[0]
     
     # ------------------------------
-    # EARLY TERMINATION CHECK (based on NN value)
+    # EARLY TERMINATION CHECK (based on NN value and policy confidence)
     # ------------------------------
     # NEW: Check if position is "decided" based on extreme value magnitude
     # Guardrails: Don't skip search in tactical positions (checks, many forcing moves)
+    # NEW: Also check policy confidence - if policy is very confident, skip MCTS
     early_termination = False
+    policy_confidence_skip = False
     
     # Compute tactical indicators
     num_check_moves = sum(1 for m in legal_move_list if ctx.board.gives_check(m))
     in_check = ctx.board.is_check()
     
     print(f"Checks available: {num_check_moves}; in_check={in_check}")
+    
+    # Policy confidence check: if top policy move has very high probability, skip MCTS
+    if move_probs and policy_move is not None:
+        top_policy_prob = move_probs.get(policy_move, 0.0)
+        # If top move has >50% probability and no tactical complexity, trust policy
+        if top_policy_prob > 0.50 and not in_check and num_check_moves < 2:
+            policy_confidence_skip = True
+            print(f"Policy confidence skip: top move has {top_policy_prob*100:.1f}% probability")
     
     # Early termination conditions:
     # 1. Value must be available
@@ -925,8 +944,9 @@ def test_func(ctx: GameContext):
                     move = legal_move_list[0]
                     print(f"Fallback to first legal move: {move.uci()}")
         # NEW: Skip PUCT if early termination is triggered (extreme value magnitude)
+        # NEW: Skip MCTS if policy is very confident (policy_confidence_skip)
         # NEW: Skip MCTS if low on time (use greedy policy for speed)
-        elif not early_termination:
+        elif not early_termination and not policy_confidence_skip:
             skip_mcts_for_time = movetime_ms > 0 and movetime_ms < LOW_TIME_SKIP_MCTS_MS
             if not skip_mcts_for_time and engine.use_puct and hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
                 decision_mode = "MCTS search"
@@ -1014,10 +1034,15 @@ def test_func(ctx: GameContext):
                     engine.search_tree = None
         else:
             # Use greedy policy selection (fast, no search)
-            # NEW: Handle early termination case with special logging
-            if early_termination:
-                decision_mode = "Greedy policy (early termination)"
-                print(f"Decision mode: {decision_mode} (value={float(value):+.3f}, ply {current_ply})")
+            # NEW: Handle early termination and policy confidence cases with special logging
+            if early_termination or policy_confidence_skip:
+                if early_termination:
+                    decision_mode = "Greedy policy (early termination)"
+                    print(f"Decision mode: {decision_mode} (value={float(value):+.3f}, ply {current_ply})")
+                else:
+                    decision_mode = "Greedy policy (high confidence)"
+                    top_prob = move_probs.get(policy_move, 0.0) if move_probs else 0.0
+                    print(f"Decision mode: {decision_mode} (top prob={top_prob*100:.1f}%, ply {current_ply})")
                 # Prefer sorted_moves[0][0] if available, otherwise fallback to policy_move
                 if sorted_moves and len(sorted_moves) > 0:
                     move = sorted_moves[0][0]
