@@ -124,6 +124,42 @@ def is_tactical_move(board: Any, move: Any) -> bool:
     return False
 
 
+def move_order_key(board: Any, move: Any) -> int:
+    """Simple move ordering key for sorting legal moves.
+    
+    Returns a negative score so that sorted() ascending puts higher scores first.
+    This prioritizes tactical moves (captures, checks, promotions) early in the search.
+    
+    Args:
+        board: A chess board object that supports:
+            - is_capture(move) -> bool
+            - gives_check(move) -> bool
+        move: A chess move object with optional promotion attribute.
+    
+    Returns:
+        Negative integer score (lower = better priority):
+        - -150: Capture + check
+        - -100: Capture
+        - -80:  Promotion
+        - -50:  Check
+        - 0:    Quiet move
+    """
+    if not CHESS_AVAILABLE:
+        return 0
+    
+    try:
+        score = 0
+        if hasattr(board, 'is_capture') and board.is_capture(move):
+            score += 100
+        if hasattr(board, 'gives_check') and board.gives_check(move):
+            score += 50
+        if hasattr(move, 'promotion') and move.promotion is not None:
+            score += 80
+        return -score  # negative so sorted() ascending puts bigger score first
+    except (AttributeError, TypeError, ValueError):
+        return 0
+
+
 def move_order_score(board: Any, move: Any) -> int:
     """Calculate move ordering score using MVV-LVA (Most Valuable Victim, Least Valuable Attacker).
     
@@ -1429,6 +1465,9 @@ def expand_node(
     else:
         # Compute and cache legal moves and mask
         legal_moves = list(state.generate_legal_moves())
+        # Sort moves by tactical priority (captures, checks, promotions first)
+        # This helps MCTS find tactics faster within limited simulations
+        legal_moves.sort(key=lambda mv: move_order_key(state, mv))
         legal_mask = legal_mask_4672(state)
         # Cache for future use
         node.legal_moves = legal_moves

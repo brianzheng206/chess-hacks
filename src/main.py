@@ -7,6 +7,7 @@ import contextlib
 import time
 from functools import lru_cache
 import numpy as np
+import chess
 
 # Note: This code uses Python 3.10+ type hint syntax (int | None, tuple[...] | None).
 # For Python 3.9 compatibility, either:
@@ -412,6 +413,58 @@ def value_to_sims_scale(value: float) -> float:
     return max(0.25, min(1.0, scale))
 
 
+# Piece values for tactical evaluation
+PIECE_VALUE = {
+    chess.PAWN: 1,
+    chess.KNIGHT: 3,
+    chess.BISHOP: 3,
+    chess.ROOK: 5,
+    chess.QUEEN: 9,
+}
+
+
+def find_obvious_tactic(board: Board, legal_moves) -> Move | None:
+    """Find obvious winning captures (simple material gain heuristic).
+    
+    This is a cheap, fast check for obvious tactical wins like:
+    - Winning a rook/queen for free
+    - Winning a minor piece for free
+    - Any capture with net gain >= 3 pawns
+    
+    Does NOT check if the captured piece is defended (that would require SEE).
+    This is intentionally simple and fast - catches the most obvious blunders.
+    
+    Args:
+        board: Current chess board position
+        legal_moves: List of legal moves to check
+        
+    Returns:
+        Best winning capture move if found, None otherwise
+    """
+    best_move = None
+    best_gain = 0  # in pawns
+    
+    for mv in legal_moves:
+        if not board.is_capture(mv):
+            continue
+        
+        piece = board.piece_at(mv.from_square)
+        captured = board.piece_at(mv.to_square)
+        if piece is None or captured is None:
+            continue
+        
+        # Calculate material gain: captured piece value - our piece value
+        gain = PIECE_VALUE.get(captured.piece_type, 0) - PIECE_VALUE.get(piece.piece_type, 0)
+        
+        # Very naive: just winning material outright (e.g. win a minor/rook/queen for free)
+        # Require gain >= 3 to catch obvious wins (rook for pawn, queen for minor, etc.)
+        if gain >= 3 and gain > best_gain:
+            best_gain = gain
+            best_move = mv
+    
+    return best_move
+
+
 def format_value_eval(value: float) -> str:
     """Convert a value in [-1, 1] to a human-readable string.
     
@@ -462,6 +515,32 @@ def test_func(ctx: GameContext):
     if not legal_moves:
         ctx.logProbabilities({})
         raise ValueError("No legal moves available (i probably lost didn't i)")
+
+    # 0. Immediate tactical wins: never miss mate-in-one
+    # This is the single highest-impact, lowest-cost accuracy boost
+    # Cost: O(#legal_moves) with one push/pop each – very cheap
+    # Effect: engine will never miss a mate in one, regardless of what the net/MCTS think
+    board = ctx.board
+    for mv in legal_moves:
+        board.push(mv)
+        if board.is_checkmate():
+            board.pop()
+            if VERBOSE:
+                print(f"Forced mate in 1 found: {mv.uci()}")
+            ctx.logProbabilities({mv: 1.0})
+            return mv
+        board.pop()
+
+    # 1. Simple tactical scan: find obvious winning captures (all phases)
+    # This catches "missed free rook/queen" type positions cheaply
+    # Cost: O(#legal_moves) - very cheap
+    # Effect: engine will never miss obvious winning captures
+    tactical_mv = find_obvious_tactic(ctx.board, legal_moves)
+    if tactical_mv is not None:
+        if VERBOSE:
+            print(f"Taking obvious winning capture: {tactical_mv.uci()}")
+        ctx.logProbabilities({tactical_mv: 1.0})
+        return tactical_mv
 
     # Check if engine is initialized
     if engine is None or model is None:
@@ -821,36 +900,45 @@ def test_func(ctx: GameContext):
     early_termination = False
     policy_confidence_skip = False
     
-    # Compute tactical indicators
+    # Compute tactical indicators (checks, captures, promotions)
+    # Tactical positions require full search - don't skip MCTS in these positions
     num_check_moves = sum(1 for m in legal_move_list if ctx.board.gives_check(m))
     in_check = ctx.board.is_check()
+    num_captures = sum(1 for m in legal_move_list if ctx.board.is_capture(m))
+    num_promotions = sum(1 for m in legal_move_list if m.promotion is not None)
+    
+    # Position is tactically heavy if there are checks, many captures, or promotions
+    tactical_heavy = in_check or num_check_moves > 1 or num_captures > 1 or num_promotions > 0
     
     if VERBOSE:
-        print(f"Checks available: {num_check_moves}; in_check={in_check}")
+        print(f"Tactical indicators: checks={num_check_moves}, in_check={in_check}, "
+              f"captures={num_captures}, promotions={num_promotions}, tactical_heavy={tactical_heavy}")
     
     # Policy confidence check: if top policy move has very high probability, skip MCTS
+    # BUT: never skip in tactical positions where the net might be overconfident
     if move_probs and policy_move is not None:
         top_policy_prob = move_probs.get(policy_move, 0.0)
         # If top move has >40% probability and no tactical complexity, trust policy (aggressive for bullet)
-        if top_policy_prob > 0.40 and not in_check and num_check_moves < 2:
+        if top_policy_prob > 0.40 and not tactical_heavy:
             policy_confidence_skip = True
             if VERBOSE:
                 print(f"Policy confidence skip: top move has {top_policy_prob*100:.1f}% probability")
+        elif tactical_heavy and VERBOSE:
+            print(f"Skipping policy confidence skip due to tactical complexity (checks/captures/promotions)")
     
     # Early termination conditions:
     # 1. Value must be available
     # 2. Must be past minimum ply
     # 3. Value magnitude must be extreme
-    # 4. Not in check (tactical)
-    # 5. Not too many check moves available (tactical)
+    # 4. Not in a tactically heavy position (checks, captures, promotions)
     if value is not None and current_ply >= VALUE_EARLY_TERMINATION_MIN_PLY:
         if abs(float(value)) >= VALUE_EARLY_TERMINATION_THRESHOLD:
-            if not in_check and num_check_moves < 3:
+            if not tactical_heavy:
                 early_termination = True
                 if VERBOSE:
                     print(f"Early termination triggered (value={float(value):+.3f})")
             elif VERBOSE:
-                print("Skipping early termination due to tactical complexity")
+                print("Skipping early termination due to tactical complexity (checks/captures/promotions)")
     
     # ------------------------------
     # STEP 2: CONFIGURE SEARCH BUDGET
@@ -1236,13 +1324,24 @@ def test_func(ctx: GameContext):
         
         # Use model/MCTS for non-opening positions
         # NEW: Force greedy policy in critical situations (critical time or losing badly)
+        # BUT: never skip search in tactical positions where tactics matter
         # Check for critical time (very low on clock)
         critical_time = movetime_ms > 0 and movetime_ms < CRITICAL_TIME_SKIP_MCTS_MS
         # Check for losing badly (very negative value)
         losing_badly = value is not None and float(value) < LOSING_BADLY_THRESHOLD
         
-        # Force greedy policy if critical time or losing badly
-        force_greedy = critical_time or losing_badly
+        # Still search in tactical positions even when losing badly - there might be tricks/perpetuals
+        # The value head might undervalue tactical opportunities
+        if losing_badly and tactical_heavy:
+            losing_badly = False  # still search in tactical chaos
+            if VERBOSE:
+                print(f"Skipping 'losing badly' greedy policy due to tactical complexity "
+                      f"(value={float(value):+.3f}, checks/captures/promotions)")
+        
+        # Force greedy policy if critical time or losing badly, BUT not in tactical positions
+        force_greedy = (critical_time or losing_badly) and not tactical_heavy
+        if (critical_time or losing_badly) and tactical_heavy and VERBOSE:
+            print("Skipping greedy policy due to tactical complexity (checks/captures/promotions)")
         if force_greedy:
             if critical_time:
                 decision_mode = "Greedy policy (critical time)"
@@ -1281,8 +1380,11 @@ def test_func(ctx: GameContext):
         # NEW: Skip PUCT if early termination is triggered (extreme value magnitude)
         # NEW: Skip MCTS if policy is very confident (policy_confidence_skip)
         # NEW: Skip MCTS if low on time (use greedy policy for speed)
+        # BUT: never skip in tactical positions where tactics matter
         elif not early_termination and not policy_confidence_skip:
-            skip_mcts_for_time = movetime_ms > 0 and movetime_ms < LOW_TIME_SKIP_MCTS_MS
+            skip_mcts_for_time = movetime_ms > 0 and movetime_ms < LOW_TIME_SKIP_MCTS_MS and not tactical_heavy
+            if movetime_ms > 0 and movetime_ms < LOW_TIME_SKIP_MCTS_MS and tactical_heavy and VERBOSE:
+                print("Skipping time-based MCTS skip due to tactical complexity (checks/captures/promotions)")
             if not skip_mcts_for_time and engine.use_puct and hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
                 decision_mode = "MCTS search"
                 if VERBOSE:
@@ -1568,6 +1670,29 @@ def test_func(ctx: GameContext):
             move_time_ms = (time.monotonic() - move_start_time) * 1000
             print(f"[DEBUG_MOVE_TIME] Total move time: {move_time_ms:.1f} ms (ply {current_ply})")
         
+        # Final tactical sanity check: if we somehow missed a mate in 1 or huge free capture,
+        # override the chosen move. This acts as a "guard rail" around the whole decision logic.
+        mate_mv = None
+        board = ctx.board
+        for mv in legal_moves:
+            board.push(mv)
+            if board.is_checkmate():
+                board.pop()
+                mate_mv = mv
+                break
+            board.pop()
+        
+        if mate_mv is not None and mate_mv != move:
+            if VERBOSE:
+                print(f"Overriding move {move.uci()} with mate-in-1 {mate_mv.uci()}")
+            move = mate_mv
+        else:
+            tactical_mv = find_obvious_tactic(ctx.board, legal_moves)
+            if tactical_mv is not None and tactical_mv != move:
+                if VERBOSE:
+                    print(f"Overriding move {move.uci()} with obvious winning capture {tactical_mv.uci()}")
+                move = tactical_mv
+        
         return move
         
     except Exception as e:
@@ -1583,6 +1708,33 @@ def test_func(ctx: GameContext):
             move_time_ms = (time.monotonic() - move_start_time) * 1000
             current_ply = len(ctx.board.move_stack) if hasattr(ctx, 'board') else 0
             print(f"[DEBUG_MOVE_TIME] Total move time (exception): {move_time_ms:.1f} ms (ply {current_ply})")
+        
+        # Final tactical sanity check: if we somehow missed a mate in 1 or huge free capture,
+        # override the chosen move. This acts as a "guard rail" around the whole decision logic.
+        # Ensure legal_moves is available (might not be if exception occurred early)
+        if 'legal_moves' not in locals() or legal_moves is None:
+            legal_moves = list(ctx.board.generate_legal_moves())
+        
+        mate_mv = None
+        board = ctx.board
+        for mv in legal_moves:
+            board.push(mv)
+            if board.is_checkmate():
+                board.pop()
+                mate_mv = mv
+                break
+            board.pop()
+        
+        if mate_mv is not None and mate_mv != move:
+            if VERBOSE:
+                print(f"Overriding move {move.uci()} with mate-in-1 {mate_mv.uci()}")
+            move = mate_mv
+        else:
+            tactical_mv = find_obvious_tactic(ctx.board, legal_moves)
+            if tactical_mv is not None and tactical_mv != move:
+                if VERBOSE:
+                    print(f"Overriding move {move.uci()} with obvious winning capture {tactical_mv.uci()}")
+                move = tactical_mv
         
         return move
 
