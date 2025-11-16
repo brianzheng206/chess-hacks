@@ -56,7 +56,7 @@ import torch
 import pathlib
 REPO_ROOT = pathlib.Path(__file__).parent.parent
 # Use stockfish_949.pt from local repository
-MODEL_PATH = str(REPO_ROOT / "stockfish_949_distilled_stronger.pt")
+MODEL_PATH = str(REPO_ROOT / "stockfish_949_fp16.pt")
 # Opening book enabled
 OPENING_BOOK_PATH = str(REPO_ROOT / "opening_book.pkl") if (REPO_ROOT / "opening_book.pkl").exists() else None
 
