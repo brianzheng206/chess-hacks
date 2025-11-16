@@ -6,15 +6,40 @@ import io
 import contextlib
 import time
 from functools import lru_cache
+import numpy as np
 
-# Compatibility shim for python-chess transposition_key
-# The chess_policy code expects board.transposition_key() as a method
-# but some python-chess versions use _transposition_key as an attribute
-if not hasattr(Board, 'transposition_key'):
-    def transposition_key(self):
-        """Compatibility method for transposition_key."""
-        return self._transposition_key
-    Board.transposition_key = transposition_key
+# Note: This code uses Python 3.10+ type hint syntax (int | None, tuple[...] | None).
+# For Python 3.9 compatibility, either:
+#   - Use Optional[int] and Optional[Tuple[...]] from typing, or
+#   - Add: from __future__ import annotations
+
+# Compatibility helper for python-chess transposition_key
+# Newer python-chess versions have transposition_key as a property (int)
+# Older versions may have it as a method or attribute
+def _get_transposition_key(board: Board) -> int | None:
+    """Get transposition key from board, handling both property and method cases.
+    
+    Returns:
+        int if transposition_key is available, None otherwise.
+    """
+    if not hasattr(board, 'transposition_key'):
+        return None
+    
+    try:
+        key = board.transposition_key
+        # If it's callable, it's a method (older python-chess)
+        if callable(key):
+            key = key()
+        # Convert to int (should already be int, but ensure it)
+        return int(key)
+    except (TypeError, AttributeError, ValueError):
+        # Fallback: try _transposition_key attribute (some versions)
+        try:
+            if hasattr(board, '_transposition_key'):
+                return int(board._transposition_key)
+        except (AttributeError, ValueError):
+            pass
+    return None
 
 # Use local chess_policy module (copied into src/chess_policy)
 from .chess_policy.train import load_checkpoint
@@ -41,7 +66,7 @@ VALUE_EARLY_TERMINATION_MIN_PLY = 2       # allow earlier termination (was 4)
 # Debug flags - set to True only when debugging (significantly impacts performance)
 DEBUG_POLICY = False  # Enable verbose policy extraction and diagnostics
 DEBUG_TENSOR = False  # Enable raw tensor diagnostics
-DEBUG_MOVE_TIME = True  # Measure and print move time
+DEBUG_MOVE_TIME = False  # Measure and print move time
 
 # Verbose output flag - set to False for bullet games to reduce I/O overhead
 VERBOSE = False
@@ -170,19 +195,127 @@ if model is not None:
 else:
     print("WARNING: Chess engine not initialized - model not loaded")
 
-# FEN-based caching for neural network evaluations
-# This avoids re-evaluating the same position multiple times
-@lru_cache(maxsize=20000)
-def _cached_nn_eval(fen: str):
-    """Cache neural network evaluations by FEN string."""
-    from chess import Board
-    board = Board(fen)
+# Global cache for neural network evaluations
+# This avoids re-evaluating the same position multiple times (transpositions, repetitions)
+# Uses transposition_key (property or method) if available (fast & collision-resistant), falls back to FEN
+_nn_eval_cache: dict = {}
+_nn_eval_cache_maxsize = 20000
+
+def _position_key_from_state(state) -> str:
+    """Get cache key for a position from any state object (Board, GameState, etc.).
+    
+    Uses transposition_key if available (fast & collision-resistant), else FEN.
+    Works directly with the state object without constructing new Board objects.
+    
+    Args:
+        state: Any object with transposition_key (property or method) and/or fen() method.
+    
+    Returns:
+        String key with prefix "tt:" for transposition keys or "fen:" for FEN strings.
+        This avoids collisions between transposition keys and FEN strings.
+    """
+    # Try transposition_key first (faster)
+    # Handle both property and method cases directly (mirror _get_transposition_key logic)
+    if hasattr(state, 'transposition_key'):
+        try:
+            key = state.transposition_key
+            # If it's callable, it's a method (older python-chess)
+            if callable(key):
+                key = key()
+            # Convert to int (should already be int, but ensure it)
+            tt_key = int(key)
+            return f"tt:{tt_key}"
+        except (TypeError, AttributeError, ValueError):
+            # Fallback: try _transposition_key attribute (some versions)
+            try:
+                if hasattr(state, '_transposition_key'):
+                    tt_key = int(state._transposition_key)
+                    return f"tt:{tt_key}"
+            except (AttributeError, ValueError):
+                pass
+    
+    # Fallback to FEN
+    if hasattr(state, 'fen'):
+        try:
+            return f"fen:{state.fen()}"
+        except Exception:
+            pass
+    
+    # Last resort: try to convert to string (shouldn't happen in practice)
+    return f"fen:{str(state)}"
+
+def _get_position_key(board: Board) -> str:
+    """Get cache key for a Board object. Wrapper around _position_key_from_state for backward compatibility."""
+    return _position_key_from_state(board)
+
+def _search_tree_matches_board(search_tree, board: Board) -> bool:
+    """Check if a search tree's root state matches the given board position.
+    
+    Uses transposition_key if available for faster comparison, falls back to FEN comparison.
+    
+    Args:
+        search_tree: SearchTree instance with root_state attribute.
+        board: Board position to compare against.
+        
+    Returns:
+        True if the tree's root state matches the board position, False otherwise.
+    """
     try:
-        move, probs, value = choose_move(board, model, device=device, temperature=0.8, sample=False)
-        return probs.cpu() if probs is not None else None, float(value) if value is not None else 0.0
-    except Exception as e:
-        print(f"Warning: Cached eval failed for FEN {fen[:20]}...: {e}")
-        return None, 0.0
+        # Use transposition_key if available for faster comparison
+        root_tt_key = _get_transposition_key(search_tree.root_state)
+        board_tt_key = _get_transposition_key(board)
+        if root_tt_key is not None and board_tt_key is not None:
+            return root_tt_key == board_tt_key
+        
+        # Fallback to FEN comparison
+        return search_tree.root_state.fen() == board.fen()
+    except Exception:
+        return False
+
+def _cached_nn_eval(board: Board) -> tuple[torch.Tensor, float] | None:
+    """Get cached neural network evaluation for a position, or None if not cached.
+    
+    Returns:
+        Tuple of (policy_logits, value) if cached, None otherwise.
+        policy_logits: [POLICY_SIZE] tensor on CPU
+        value: float in [-1, 1]
+    """
+    cache_key = _get_position_key(board)
+    return _nn_eval_cache.get(cache_key)
+
+def _cache_nn_eval(board: Board, policy_logits: torch.Tensor, value: float) -> None:
+    """Cache neural network evaluation for a position.
+    
+    Args:
+        board: Chess board position
+        policy_logits: Policy logits tensor [POLICY_SIZE] (will be moved to CPU)
+        value: Value prediction in [-1, 1]
+    
+    Note:
+        Eviction is FIFO (First In First Out), not true LRU. Since CPython dicts are
+        insertion-ordered, we remove the oldest entry. Access doesn't bump recency.
+        This is effectively a ring buffer of recent positions, which is fine for chess
+        where we want to keep recent positions cached. For true LRU, use collections.OrderedDict
+        or functools.lru_cache, but FIFO is usually sufficient.
+    """
+    cache_key = _get_position_key(board)
+    # Ensure logits are on CPU for caching
+    if policy_logits.device.type != 'cpu':
+        policy_logits = policy_logits.cpu()
+    
+    # FIFO eviction: if cache is full, remove oldest entry (first in insertion order)
+    # This is effectively a ring buffer of recent positions, not true LRU
+    if len(_nn_eval_cache) >= _nn_eval_cache_maxsize:
+        # Remove first (oldest) entry
+        oldest_key = next(iter(_nn_eval_cache))
+        del _nn_eval_cache[oldest_key]
+    
+    _nn_eval_cache[cache_key] = (policy_logits, float(value))
+
+def _clear_nn_eval_cache() -> None:
+    """Clear the neural network evaluation cache."""
+    global _nn_eval_cache
+    _nn_eval_cache.clear()
 
 def search_with_budget(engine, board, sims_cap, time_ms):
     """Time-budgeted search wrapper that caps wall-clock time."""
@@ -347,19 +480,21 @@ def test_func(ctx: GameContext):
     
     # Try to update search tree if it exists and position changed
     # This handles tree reuse when opponent plays a move
+    # OPTIMIZATION: Aggressively reuse tree by checking if opponent's move leads to a position in the tree
     if hasattr(engine, 'search_tree') and engine.search_tree is not None:
         try:
-            # Check if we can update the tree to match current position
-            # If the tree's root is one move away (opponent's move), update it
-            if engine.search_tree.root_state.fen() != ctx.board.fen():
+            tree_matches = _search_tree_matches_board(engine.search_tree, ctx.board)
+            
+            if not tree_matches:
                 # Position changed - could be opponent's move
-                # Try to find if any child of current root matches the new position
-                # For now, we'll recreate if position doesn't match (simple approach)
-                # A more sophisticated approach would check if position is reachable from tree
-                engine.search_tree = None  # Will be recreated below if needed
+                # Try aggressive tree reuse: check if current position is reachable from the tree
+                if not engine.search_tree.update_root_to_position(ctx.board):
+                    # Position not in tree - will be handled below when creating/updating tree
+                    # Don't set to None here, let the code below handle it with precomputed root evaluation
+                    pass
         except Exception:
-            # If check fails, reset tree
-            engine.search_tree = None
+            # If check fails, tree will be recreated below if needed
+            pass
     
     # Convert to list for easier access
     legal_move_list = list(legal_moves)
@@ -377,6 +512,8 @@ def test_func(ctx: GameContext):
     policy_move = None
     probs_tensor = None
     value = None
+    root_policy_logits = None  # Store raw logits for SearchTree to avoid redundant NN evaluation
+    root_value = None
     sorted_moves = []   # NEW: always defined as list
     move_probs = {}     # NEW: initialize here for logging
 
@@ -391,15 +528,107 @@ def test_func(ctx: GameContext):
                 # Mid/endgame: slightly higher temperature
                 temperature = 0.8
             
-            # Single forward pass - compute policy once with timing
+            # OPTIMIZATION: Check cache first to avoid redundant NN forward pass for repeated positions
+            # This catches repetitions, transpositions, and "shuffling" in time trouble
             nn_start = time.monotonic()
-            policy_move, probs_tensor, value = choose_move(
-                ctx.board,
-                model,
-                device=device,
-                temperature=temperature,
-                sample=False
-            )
+            from .chess_policy.encoding import board_to_tensor, legal_mask_4672
+            from .chess_policy.infer import unpack_policy, mask_logits, probs_from_logits
+            from .chess_policy.move_index import index_to_move, POLICY_SIZE
+            
+            # Check cache first
+            cached_result = _cached_nn_eval(ctx.board)
+            if cached_result is not None:
+                # Cache hit! Reconstruct policy_move and probs_tensor from cached logits
+                root_policy_logits, root_value = cached_result
+                value = root_value
+                
+                # Reconstruct probs_tensor and policy_move from cached logits (cheap operations)
+                # Move logits to device for processing
+                logits = root_policy_logits.to(device)
+                
+                # Generate legal mask and compute probabilities for policy move selection
+                legal = torch.from_numpy(legal_mask_4672(ctx.board)).to(logits.device)
+                masked = mask_logits(logits, legal)
+                probs = probs_from_logits(masked, temperature=temperature)
+                probs_tensor = probs.detach().cpu()
+                
+                # Select policy move (argmax)
+                idx = int(torch.argmax(probs).item())
+                policy_move = index_to_move(ctx.board, idx) if 0 <= idx < POLICY_SIZE else None
+                
+                # Fallback if move is invalid
+                if policy_move is None or policy_move not in legal_moves:
+                    order = torch.argsort(probs, descending=True).tolist()
+                    for i in order:
+                        if 0 <= i < POLICY_SIZE:
+                            mv_try = index_to_move(ctx.board, int(i))
+                            if mv_try is not None and mv_try in legal_moves:
+                                policy_move = mv_try
+                                break
+                    if policy_move is None or policy_move not in legal_moves:
+                        policy_move = legal_move_list[0]
+                
+                if VERBOSE:
+                    print(f"Root eval: cache hit (reconstructed from cached logits)")
+            else:
+                # Cache miss: do full forward pass
+                # Encode board and run model once
+                x_np = board_to_tensor(ctx.board)
+                c_encoded = x_np.shape[0]
+                try:
+                    c_model = int(getattr(model, "in_channels", c_encoded))
+                except Exception:
+                    c_model = c_encoded
+                if c_encoded > c_model:
+                    x_np = x_np[:c_model]
+                elif c_encoded < c_model:
+                    pad = np.zeros((c_model - c_encoded, x_np.shape[1], x_np.shape[2]), dtype=x_np.dtype)
+                    x_np = np.concatenate([x_np, pad], axis=0)
+                
+                x = torch.from_numpy(x_np).unsqueeze(0).to(device)
+                model.eval()
+                with torch.inference_mode():
+                    output = model(x)
+                    logits_b, v_pred = unpack_policy(output)
+                    logits = logits_b[0] if logits_b.dim() == 2 and logits_b.size(0) == 1 else logits_b
+                    
+                    # Extract value
+                    value = 0.0
+                    if v_pred is not None:
+                        v = v_pred
+                        if v.dim() == 2 and v.size(0) == 1:
+                            v = v[0]
+                        value = float(v.squeeze(-1).cpu().item())
+                
+                # Generate legal mask and compute probabilities for policy move selection
+                legal = torch.from_numpy(legal_mask_4672(ctx.board)).to(logits.device)
+                masked = mask_logits(logits, legal)
+                probs = probs_from_logits(masked, temperature=temperature)
+                probs_tensor = probs.detach().cpu()
+                
+                # Select policy move (argmax)
+                idx = int(torch.argmax(probs).item())
+                policy_move = index_to_move(ctx.board, idx) if 0 <= idx < POLICY_SIZE else None
+                
+                # Fallback if move is invalid
+                if policy_move is None or policy_move not in legal_moves:
+                    order = torch.argsort(probs, descending=True).tolist()
+                    for i in order:
+                        if 0 <= i < POLICY_SIZE:
+                            mv_try = index_to_move(ctx.board, int(i))
+                            if mv_try is not None and mv_try in legal_moves:
+                                policy_move = mv_try
+                                break
+                    if policy_move is None or policy_move not in legal_moves:
+                        policy_move = legal_move_list[0]
+                
+                # Store raw logits for passing to SearchTree (avoid redundant NN evaluation)
+                root_policy_logits = logits.detach().cpu()  # Store on CPU, will move to device in SearchTree if needed
+                root_value = value
+                
+                # Cache this evaluation for future use (transpositions, repetitions)
+                _cache_nn_eval(ctx.board, root_policy_logits, root_value)
+            
             nn_time = (time.monotonic() - nn_start) * 1000
             if VERBOSE:
                 if nn_time > 10:  # Only print if it's significant
@@ -1007,13 +1236,20 @@ def test_func(ctx: GameContext):
                 if VERBOSE:
                     print(f"Decision mode: {decision_mode} (value={float(value):+.3f}, ply {current_ply})")
             
-            # If we already did NN eval, just use it (avoids redundant choose_move call)
-            if not skip_nn_eval and policy_move is not None and policy_move in legal_moves:
+            # OPTIMIZATION: Always prefer policy_move if available (avoids redundant choose_move call)
+            # policy_move is valid if we did NN eval in this function call OR if it was set from a previous call
+            if policy_move is not None and policy_move in legal_moves:
                 move = policy_move
                 if VERBOSE:
                     print(f"Using cached policy_move: {move.uci()}")
+            elif not skip_nn_eval:
+                # We did NN eval but policy_move is invalid - this shouldn't happen, but handle gracefully
+                # Fallback to first legal move (we already have probs_tensor if needed)
+                move = legal_move_list[0]
+                if VERBOSE:
+                    print(f"Warning: policy_move invalid, using first legal move: {move.uci()}")
             else:
-                # Only in very early opening (skip_nn_eval) do we actually need a fresh call
+                # Only call choose_move if we skipped NN eval earlier (very early opening)
                 try:
                     mv, _, _ = choose_move(ctx.board, model, device=device, temperature=0.8, sample=False)
                     move = mv
@@ -1022,13 +1258,9 @@ def test_func(ctx: GameContext):
                 except Exception as e:
                     # Fallback if choose_move fails
                     print(f"info string Error in greedy selection: {e}", file=sys.stderr)
-                    # Fallback to policy_move or first legal move
-                    if policy_move is not None and policy_move in legal_moves:
-                        move = policy_move
-                        print(f"Fallback to policy_move: {move.uci()}")
-                    else:
-                        move = legal_move_list[0]
-                        print(f"Fallback to first legal move: {move.uci()}")
+                    # Fallback to first legal move
+                    move = legal_move_list[0]
+                    print(f"Fallback to first legal move: {move.uci()}")
         # NEW: Skip PUCT if early termination is triggered (extreme value magnitude)
         # NEW: Skip MCTS if policy is very confident (policy_confidence_skip)
         # NEW: Skip MCTS if low on time (use greedy policy for speed)
@@ -1036,23 +1268,104 @@ def test_func(ctx: GameContext):
             skip_mcts_for_time = movetime_ms > 0 and movetime_ms < LOW_TIME_SKIP_MCTS_MS
             if not skip_mcts_for_time and engine.use_puct and hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
                 decision_mode = "MCTS search"
-                print(f"Decision mode: {decision_mode} (ply {current_ply}, phase={game_phase:.2f})")
+                if VERBOSE:
+                    print(f"Decision mode: {decision_mode} (ply {current_ply}, phase={game_phase:.2f})")
             
             # Initialize or update search tree
+            # OPTIMIZATION: Pass precomputed root evaluation and position cache to avoid redundant NN forward pass
             from .chess_policy.mcts import SearchTree
+            root_policy_logits_for_tree = root_policy_logits if not skip_nn_eval else None
+            root_value_for_tree = root_value if not skip_nn_eval else None
+            
+            # Pass cache functions for transposition/repetition caching
+            # OPTIMIZATION: Use shared key function to avoid creating Board objects
+            def cache_get(state):
+                """Get cached evaluation for a position."""
+                try:
+                    cache_key = _position_key_from_state(state)
+                    return _nn_eval_cache.get(cache_key)
+                except Exception:
+                    return None
+            
+            def cache_set(state, logits, value):
+                """Cache evaluation for a position.
+                
+                Uses FIFO eviction (ring buffer of recent positions), not true LRU.
+                """
+                try:
+                    cache_key = _position_key_from_state(state)
+                    # Ensure logits are on CPU for caching
+                    if logits.device.type != 'cpu':
+                        logits = logits.cpu()
+                    
+                    # FIFO eviction: if cache is full, remove oldest entry (first in insertion order)
+                    if len(_nn_eval_cache) >= _nn_eval_cache_maxsize:
+                        oldest_key = next(iter(_nn_eval_cache))
+                        del _nn_eval_cache[oldest_key]
+                    
+                    _nn_eval_cache[cache_key] = (logits, float(value))
+                except Exception:
+                    pass
+            
             if not hasattr(engine, 'search_tree') or engine.search_tree is None:
-                # No existing tree - create new one
-                engine.search_tree = SearchTree(ctx.board, engine.model, engine.mcts_config)
+                # No existing tree - create new one with precomputed root evaluation and cache
+                engine.search_tree = SearchTree(
+                    ctx.board, 
+                    engine.model, 
+                    engine.mcts_config,
+                    root_policy_logits=root_policy_logits_for_tree,
+                    root_value=root_value_for_tree,
+                    position_cache_get=cache_get,
+                    position_cache_set=cache_set,
+                )
             else:
                 # Check if tree matches current position
                 try:
-                    if engine.search_tree.root_state.fen() != ctx.board.fen():
-                        # Position changed - try to reuse tree if we can update it
-                        # For now, create new tree (could be improved to check if position is one move away)
-                        engine.search_tree = SearchTree(ctx.board, engine.model, engine.mcts_config)
+                    tree_matches = _search_tree_matches_board(engine.search_tree, ctx.board)
+                    
+                    if not tree_matches:
+                        # Position changed - try aggressive tree reuse
+                        # Check if current position is reachable from the tree (opponent's move scenario)
+                        if engine.search_tree.update_root_to_position(ctx.board):
+                            # Successfully re-rooted tree to match current position
+                            if VERBOSE:
+                                print(f"Tree reuse: re-rooted to opponent's move position (aggressive reuse)")
+                        else:
+                            # Current position not in tree - create new tree
+                            engine.search_tree = SearchTree(
+                                ctx.board, 
+                                engine.model, 
+                                engine.mcts_config,
+                                root_policy_logits=root_policy_logits_for_tree,
+                                root_value=root_value_for_tree,
+                                position_cache_get=cache_get,
+                                position_cache_set=cache_set,
+                            )
                 except Exception:
-                    # If comparison fails, create new tree
-                    engine.search_tree = SearchTree(ctx.board, engine.model, engine.mcts_config)
+                    # If comparison fails, try to reuse tree, otherwise create new one
+                    try:
+                        if not engine.search_tree.update_root_to_position(ctx.board):
+                            # Couldn't reuse, create new tree
+                            engine.search_tree = SearchTree(
+                                ctx.board, 
+                                engine.model, 
+                                engine.mcts_config,
+                                root_policy_logits=root_policy_logits_for_tree,
+                                root_value=root_value_for_tree,
+                                position_cache_get=cache_get,
+                                position_cache_set=cache_set,
+                            )
+                    except Exception:
+                        # If reuse attempt fails, create new tree
+                        engine.search_tree = SearchTree(
+                            ctx.board, 
+                            engine.model, 
+                            engine.mcts_config,
+                            root_policy_logits=root_policy_logits_for_tree,
+                            root_value=root_value_for_tree,
+                            position_cache_get=cache_get,
+                            position_cache_set=cache_set,
+                        )
             
             # Update config with current sims
             engine.mcts_config.n_simulations = sims
@@ -1150,12 +1463,18 @@ def test_func(ctx: GameContext):
                 decision_mode = "Greedy policy (low time)"
                 if VERBOSE:
                     print(f"Decision mode: {decision_mode} (movetime_ms={movetime_ms}, ply {current_ply})")
-                # If we already did NN eval, just use it (avoids redundant choose_move call)
-                if not skip_nn_eval and policy_move is not None and policy_move in legal_moves:
+                # OPTIMIZATION: Always prefer policy_move if available (avoids redundant choose_move call)
+                if policy_move is not None and policy_move in legal_moves:
                     move = policy_move
                     if VERBOSE:
                         print(f"Using cached policy_move: {move.uci()}")
+                elif not skip_nn_eval:
+                    # We did NN eval but policy_move is invalid - fallback to first legal move
+                    move = legal_move_list[0]
+                    if VERBOSE:
+                        print(f"Warning: policy_move invalid, using first legal move: {move.uci()}")
                 else:
+                    # Only call choose_move if we skipped NN eval earlier
                     try:
                         mv, _, _ = choose_move(ctx.board, model, device=device, temperature=0.8, sample=False)
                         move = mv
@@ -1167,12 +1486,18 @@ def test_func(ctx: GameContext):
                 decision_mode = "Greedy policy"
                 if VERBOSE:
                     print(f"Decision mode: {decision_mode} (ply {current_ply})")
-                # If we already did NN eval, just use it (avoids redundant choose_move call)
-                if not skip_nn_eval and policy_move is not None and policy_move in legal_moves:
+                # OPTIMIZATION: Always prefer policy_move if available (avoids redundant choose_move call)
+                if policy_move is not None and policy_move in legal_moves:
                     move = policy_move
                     if VERBOSE:
                         print(f"Using cached policy_move: {move.uci()}")
+                elif not skip_nn_eval:
+                    # We did NN eval but policy_move is invalid - fallback to first legal move
+                    move = legal_move_list[0]
+                    if VERBOSE:
+                        print(f"Warning: policy_move invalid, using first legal move: {move.uci()}")
                 else:
+                    # Only call choose_move if we skipped NN eval earlier
                     try:
                         mv, _, _ = choose_move(ctx.board, model, device=device, temperature=0.8, sample=False)
                         move = mv
@@ -1250,6 +1575,6 @@ def reset_func(ctx: GameContext):
         engine.ucinewgame()  # This resets the board and clears caches
     else:
         print("Warning: engine is None in reset_func; skipping ucinewgame()")
-    # Clear the FEN cache to avoid memory buildup
-    _cached_nn_eval.cache_clear()
+    # Clear the NN evaluation cache to avoid memory buildup
+    _clear_nn_eval_cache()
     print("Chess engine reset complete")

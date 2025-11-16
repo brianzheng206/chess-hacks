@@ -8,7 +8,7 @@ predictions to guide exploration and selection.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Protocol, Tuple, TYPE_CHECKING, Optional, Dict, Any
+from typing import Protocol, Tuple, TYPE_CHECKING, Optional, Dict, Any, Callable
 import math
 import threading
 
@@ -25,6 +25,34 @@ except ImportError:
     CHESS_AVAILABLE = False
     chess = None
 
+
+def _get_transposition_key(state: GameState) -> Optional[int]:
+    """Get transposition key from game state, handling both property and method cases.
+    
+    Newer python-chess versions have transposition_key as a property (int).
+    Older versions may have it as a method or attribute.
+    
+    Returns:
+        int if transposition_key is available, None otherwise.
+    """
+    if not hasattr(state, 'transposition_key'):
+        return None
+    
+    try:
+        key = state.transposition_key
+        # If it's callable, it's a method (older python-chess)
+        if callable(key):
+            key = key()
+        # Convert to int (should already be int, but ensure it)
+        return int(key)
+    except (TypeError, AttributeError, ValueError):
+        # Fallback: try _transposition_key attribute (some versions)
+        try:
+            if hasattr(state, '_transposition_key'):
+                return int(state._transposition_key)
+        except (AttributeError, ValueError):
+            pass
+    return None
 
 def is_tactical_move(board: Any, move: Any) -> bool:
     """Returns True if the move is a check or a capture.
@@ -346,6 +374,10 @@ class SearchTree:
         root_state: GameState,
         model: nn.Module,
         config: SearchConfig,
+        root_policy_logits: Optional[torch.Tensor] = None,
+        root_value: Optional[float] = None,
+        position_cache_get: Optional[Callable[[GameState], Optional[Tuple[torch.Tensor, float]]]] = None,
+        position_cache_set: Optional[Callable[[GameState, torch.Tensor, float], None]] = None,
     ):
         """Initialize a search tree.
         
@@ -353,9 +385,21 @@ class SearchTree:
             root_state: Initial game state (root position).
             model: Neural network model for position evaluation.
             config: SearchConfig with search parameters.
+            root_policy_logits: Optional precomputed policy logits for root position.
+                If provided, avoids redundant NN evaluation of root. Shape: [POLICY_SIZE].
+            root_value: Optional precomputed value for root position.
+                If provided, avoids redundant NN evaluation of root. Range: [-1, 1].
+            position_cache_get: Optional function to get cached evaluation for transpositions.
+            position_cache_set: Optional function to cache evaluations for transpositions.
         """
         self.model = model
         self.config = config
+        self.position_cache_get = position_cache_get
+        self.position_cache_set = position_cache_set
+        
+        # Store precomputed root evaluation to avoid redundant NN forward pass
+        self.root_policy_logits = root_policy_logits
+        self.root_value = root_value
         
         # Track previous root value for blunder detection
         # This enables automatic "double sims on eval spike" move-to-move
@@ -389,6 +433,115 @@ class SearchTree:
         
         self.root = SearchNode(parent=None, prior=1.0, state=root_state, to_play=to_play)
         self.root_state = root_state.copy() if hasattr(root_state, 'copy') else root_state
+    
+    def find_child_by_position(self, target_position: GameState, max_depth: int = 1) -> Optional[Tuple[AnyMoveType, SearchNode]]:
+        """Find a child node that matches the target position.
+        
+        Searches through children of the current root (and optionally deeper) to find
+        one whose state matches the target position. Uses transposition_key (property or method)
+        if available for faster comparison, falls back to FEN string comparison.
+        
+        This enables aggressive tree reuse: if the opponent's move leads to a position
+        that was already explored in the tree, we can reuse that subtree instead of
+        discarding the entire tree.
+        
+        Args:
+            target_position: The target game state to find in the tree.
+            max_depth: Maximum depth to search (1 = direct children only, 2 = grandchildren, etc.)
+                      Default 1 for performance, but can be increased for more aggressive reuse.
+            
+        Returns:
+            Tuple of (move, child_node) if a matching child is found, None otherwise.
+            Note: move is the move from root to the matching node (may be a sequence for depth > 1).
+        """
+        # Get target position key for comparison
+        target_key = _get_transposition_key(target_position)
+        target_fen = None
+        try:
+            if hasattr(target_position, 'fen'):
+                target_fen = target_position.fen()
+        except Exception:
+            pass
+        
+        if target_key is None and target_fen is None:
+            return None
+        
+        # Helper function to check if a node matches the target position
+        def node_matches(node: SearchNode) -> bool:
+            if node.state is None:
+                return False
+            
+            # Try transposition key first (faster)
+            if target_key is not None:
+                child_key = _get_transposition_key(node.state)
+                if child_key is not None and child_key == target_key:
+                    return True
+            
+            # Fallback to FEN comparison
+            if target_fen is not None:
+                try:
+                    if hasattr(node.state, 'fen'):
+                        child_fen = node.state.fen()
+                        if child_fen == target_fen:
+                            return True
+                except Exception:
+                    pass
+            
+            return False
+        
+        # Search through direct children first (most common case)
+        for move, child in self.root.children.items():
+            if node_matches(child):
+                return (move, child)
+        
+        # If max_depth > 1, search grandchildren (for more aggressive reuse)
+        # This is useful when opponent's move sequence leads to a transposition
+        if max_depth > 1:
+            for move1, child1 in self.root.children.items():
+                if child1.is_expanded and not child1.is_terminal:
+                    for move2, child2 in child1.children.items():
+                        if node_matches(child2):
+                            # Return the first move (we'll need to update root twice)
+                            # For now, just return the direct child - caller can handle deeper search
+                            # TODO: Support multi-move paths for even more aggressive reuse
+                            pass
+        
+        return None
+    
+    def update_root_to_position(self, target_position: GameState) -> bool:
+        """Update the root to a child node matching the target position.
+        
+        This is more aggressive than update_root(move): it searches for any child
+        that matches the target position, not just a specific move. This enables
+        reusing the tree when the opponent plays a move that leads to a position
+        we've already explored.
+        
+        Args:
+            target_position: The target game state to re-root to.
+            
+        Returns:
+            True if the root was successfully updated, False if no matching child was found.
+        """
+        result = self.find_child_by_position(target_position)
+        if result is None:
+            return False
+        
+        move, new_root = result
+        
+        # Update root state to match target position
+        # We can't just push the move because we need to match the exact position
+        # (in case of transpositions or different move sequences)
+        if hasattr(target_position, 'copy'):
+            self.root_state = target_position.copy()
+        else:
+            self.root_state = target_position
+        
+        # Clear parent reference and make this the new root
+        new_root.parent = None
+        new_root.prior = 1.0  # Root has no prior
+        self.root = new_root
+        
+        return True
     
     def update_root(self, played_move: AnyMoveType) -> None:
         """Update the root to the child node corresponding to the played move.
@@ -478,6 +631,10 @@ class SearchTree:
             max_simulations_override=max_simulations_override,
             prev_root_value=self.prev_root_value,
             batch_evaluator=self.batch_evaluator,  # Reuse batch evaluator for cross-search caching
+            root_policy_logits=self.root_policy_logits,  # Pass precomputed root evaluation
+            root_value=self.root_value,
+            position_cache_get=self.position_cache_get,  # Pass position cache for transpositions
+            position_cache_set=self.position_cache_set,
         )
         # Store current root value for next search (blunder detection)
         self.prev_root_value = current_root_value
@@ -851,6 +1008,8 @@ def evaluate_state_with_model(
     model: nn.Module,
     device: torch.device | str,
     batch_evaluator: Optional[BatchEvaluator] = None,
+    position_cache_get: Optional[Callable[[GameState], Optional[Tuple[torch.Tensor, float]]]] = None,
+    position_cache_set: Optional[Callable[[GameState, torch.Tensor, float], None]] = None,
 ) -> Tuple[torch.Tensor, float]:
     """Evaluate a game state using the neural network model.
     
@@ -866,6 +1025,10 @@ def evaluate_state_with_model(
         device: PyTorch device for model inference.
         batch_evaluator: Optional BatchEvaluator for batch inference. If provided,
             the state will be added to the batch queue instead of evaluated immediately.
+        position_cache_get: Optional function to get cached evaluation. Should accept
+            a GameState and return (policy_logits, value) tuple or None if not cached.
+        position_cache_set: Optional function to cache evaluation. Should accept
+            (GameState, policy_logits, value) and store the result.
     
     Returns:
         A tuple of:
@@ -877,6 +1040,26 @@ def evaluate_state_with_model(
     The encoding handles channel alignment automatically to support models
     trained with different numbers of input channels (e.g., 18 vs 25).
     """
+    # Check global position cache first (for transpositions and repetitions)
+    # This is checked before batch evaluator cache because it's a global cache
+    # that persists across searches and can catch transpositions
+    if position_cache_get is not None:
+        try:
+            cached_result = position_cache_get(state)
+            if cached_result is not None:
+                logits, value = cached_result
+                # Ensure logits are tensor (might be from cache)
+                if not isinstance(logits, torch.Tensor):
+                    logits = torch.tensor(logits)
+                # Move to device if needed (cache stores on CPU)
+                device_obj = torch.device(device) if isinstance(device, str) else device
+                if logits.device != device_obj:
+                    logits = logits.to(device_obj)
+                return logits, value
+        except Exception:
+            # If cache lookup fails, continue with normal evaluation
+            pass
+    
     # If batch evaluator is provided, use it for batching
     if batch_evaluator is not None:
         # Check cache and mark as cached if found (thread-safe)
@@ -949,6 +1132,14 @@ def evaluate_state_with_model(
     if batch_evaluator is not None:
         batch_evaluator.cache_single_result(state, logits.cpu(), value)
     
+    # Also cache in global position cache if provided (for transpositions across searches)
+    if position_cache_set is not None:
+        try:
+            position_cache_set(state, logits.cpu(), value)
+        except Exception:
+            # If cache store fails, continue (non-critical)
+            pass
+    
     return logits.cpu(), value
 
 
@@ -958,6 +1149,10 @@ def expand_node(
     model: nn.Module,
     config: SearchConfig,
     batch_evaluator: Optional[BatchEvaluator] = None,
+    precomputed_policy_logits: Optional[torch.Tensor] = None,
+    precomputed_value: Optional[float] = None,
+    position_cache_get: Optional[Callable[[GameState], Optional[Tuple[torch.Tensor, float]]]] = None,
+    position_cache_set: Optional[Callable[[GameState, torch.Tensor, float], None]] = None,
 ) -> float:
     """Expand a search node by evaluating it with the neural network.
     
@@ -977,6 +1172,13 @@ def expand_node(
         state: Game state at this node (must implement GameState protocol).
         model: Neural network model for evaluation (only called for non-terminal positions).
         config: SearchConfig with device and other parameters.
+        batch_evaluator: Optional BatchEvaluator for batch inference.
+        precomputed_policy_logits: Optional precomputed policy logits. If provided and this is
+            the root node, avoids redundant NN evaluation. Shape: [POLICY_SIZE].
+        precomputed_value: Optional precomputed value. If provided and this is the root node,
+            avoids redundant NN evaluation. Range: [-1, 1].
+        position_cache_get: Optional function to get cached evaluation for transpositions.
+        position_cache_set: Optional function to cache evaluations for transpositions.
     
     Returns:
         float: The value to be backed up in the tree:
@@ -1040,8 +1242,26 @@ def expand_node(
     # Non-terminal: evaluate with model
     # Only reach here if state.is_game_over() is False
     # The neural network value is from the POV of state.turn (the side to move) in [-1, 1]
-    device = torch.device(config.device) if isinstance(config.device, str) else config.device
-    policy_logits, value = evaluate_state_with_model(state, model, device, batch_evaluator)
+    # Use precomputed evaluation if available (typically for root node to avoid redundant NN pass)
+    if precomputed_policy_logits is not None and precomputed_value is not None:
+        # Use precomputed evaluation - ensure logits are on correct device
+        device = torch.device(config.device) if isinstance(config.device, str) else config.device
+        if precomputed_policy_logits.device != device:
+            policy_logits = precomputed_policy_logits.to(device)
+        else:
+            policy_logits = precomputed_policy_logits
+        value = precomputed_value
+        # Cache the result in batch_evaluator for consistency
+        if batch_evaluator is not None:
+            batch_evaluator.cache_single_result(state, policy_logits.cpu(), value)
+    else:
+        # Evaluate with model (normal case for non-root nodes)
+        device = torch.device(config.device) if isinstance(config.device, str) else config.device
+        policy_logits, value = evaluate_state_with_model(
+            state, model, device, batch_evaluator,
+            position_cache_get=position_cache_get,
+            position_cache_set=position_cache_set,
+        )
     
     # Get legal moves and build mask
     legal_moves = list(state.generate_legal_moves())
@@ -1141,6 +1361,8 @@ def run_simulation(
     config: SearchConfig,
     batch_evaluator: Optional[BatchEvaluator] = None,
     max_depth_override: Optional[int] = None,
+    position_cache_get: Optional[Callable[[GameState], Optional[Tuple[torch.Tensor, float]]]] = None,
+    position_cache_set: Optional[Callable[[GameState, torch.Tensor, float], None]] = None,
 ) -> None:
     """Run a single MCTS simulation starting at root.
 
@@ -1223,7 +1445,11 @@ def run_simulation(
             else:
                 # Expand the leaf node
                 # expand_node returns value from the POV of the player to move at the leaf
-                leaf_value = expand_node(node, leaf_state, model, config, batch_evaluator)
+                leaf_value = expand_node(
+                    node, leaf_state, model, config, batch_evaluator,
+                    position_cache_get=position_cache_get,
+                    position_cache_set=position_cache_set,
+                )
             
             # Ensure we have a valid value
             if leaf_value is None:
@@ -1332,6 +1558,10 @@ def mcts_search(
     max_simulations_override: Optional[int] = None,
     prev_root_value: Optional[float] = None,
     batch_evaluator: Optional[BatchEvaluator] = None,
+    root_policy_logits: Optional[torch.Tensor] = None,
+    root_value: Optional[float] = None,
+    position_cache_get: Optional[Callable[[GameState], Optional[Tuple[torch.Tensor, float]]]] = None,
+    position_cache_set: Optional[Callable[[GameState, torch.Tensor, float], None]] = None,
 ) -> Tuple[AnyMoveType, torch.Tensor, float]:
     """Run MCTS with PUCT starting from root_state.
     
@@ -1362,6 +1592,12 @@ def mcts_search(
         prev_root_value: Optional value from previous position (from opponent's POV).
             Used to detect blunders: if current_root_value - prev_root_value > 0.5,
             we double the simulation budget.
+        root_policy_logits: Optional precomputed policy logits for root position.
+            If provided, avoids redundant NN evaluation of root. Shape: [POLICY_SIZE].
+        root_value: Optional precomputed value for root position.
+            If provided, avoids redundant NN evaluation of root. Range: [-1, 1].
+        position_cache_get: Optional function to get cached evaluation for transpositions.
+        position_cache_set: Optional function to cache evaluations for transpositions.
     
     Returns:
         A tuple of:
@@ -1396,23 +1632,30 @@ def mcts_search(
     
     # Initialize root node and capture root value
     # All root evaluations go through batch_evaluator for caching
+    # If precomputed root evaluation is provided, use it to avoid redundant NN forward pass
     if root_node is not None:
         root = root_node
         # If root is already expanded, we can reuse it
         if not root.is_expanded:
-            # Expand root and capture value, using batch_evaluator so root eval is cached
+            # Expand root and capture value, using precomputed evaluation if available
             current_root_value = expand_node(
                 root,
                 root_state,
                 model,
                 config,
                 batch_evaluator=batch_evaluator,
+                precomputed_policy_logits=root_policy_logits,
+                precomputed_value=root_value,
+                position_cache_get=position_cache_get,
+                position_cache_set=position_cache_set,
             )
         else:
-            # Root already expanded, get value from root's Q-value or evaluate
-            # If root has been visited, use Q-value; otherwise evaluate with batch_evaluator
+            # Root already expanded, get value from root's Q-value or use precomputed value
+            # If root has been visited, use Q-value; otherwise use precomputed or evaluate
             if root.visit_count > 0:
                 current_root_value = root.q_value
+            elif root_value is not None:
+                current_root_value = root_value
             else:
                 device = torch.device(config.device) if isinstance(config.device, str) else config.device
                 _, current_root_value = evaluate_state_with_model(
@@ -1420,6 +1663,8 @@ def mcts_search(
                     model,
                     device,
                     batch_evaluator=batch_evaluator,
+                    position_cache_get=position_cache_get,
+                    position_cache_set=position_cache_set,
                 )
     else:
         # Determine to_play from root_state
@@ -1442,12 +1687,17 @@ def mcts_search(
         
         # Immediately expand the root and capture the root value
         # expand_node returns the value from the network (from POV of side to move)
+        # Use precomputed evaluation if available to avoid redundant NN forward pass
         current_root_value = expand_node(
             root,
             root_state,
             model,
             config,
             batch_evaluator=batch_evaluator,
+            precomputed_policy_logits=root_policy_logits,
+            precomputed_value=root_value,
+            position_cache_get=position_cache_get,
+            position_cache_set=position_cache_set,
         )
     
     # BLUNDER-SENSITIVE SIMULATION BUDGET
@@ -1549,7 +1799,12 @@ def mcts_search(
                 # Time budget exhausted
                 break
         
-        run_simulation(root, root_state, model, config, batch_evaluator, max_depth_override=effective_max_depth)
+        run_simulation(
+            root, root_state, model, config, batch_evaluator,
+            max_depth_override=effective_max_depth,
+            position_cache_get=position_cache_get,
+            position_cache_set=position_cache_set,
+        )
         
         # Periodically flush batches during search for better GPU utilization
         # This reduces latency and improves throughput
@@ -1593,7 +1848,11 @@ def mcts_search(
     from .encoding import legal_mask_4672
     device = torch.device(config.device) if isinstance(config.device, str) else config.device
     # Pass batch_evaluator to reuse cached result (root was already evaluated during expansion)
-    policy_logits, _ = evaluate_state_with_model(root_state, model, device, batch_evaluator)
+    policy_logits, _ = evaluate_state_with_model(
+        root_state, model, device, batch_evaluator,
+        position_cache_get=position_cache_get,
+        position_cache_set=position_cache_set,
+    )
     
     # Get legal moves and build policy distribution p over the same move order
     legal_moves = list(root_state.generate_legal_moves())
@@ -1739,7 +1998,15 @@ def mcts_search(
     return chosen_move, visit_dist, current_root_value
 
 
-def debug_root_stats(root: SearchNode, root_state: GameState, model: nn.Module, config: SearchConfig, top_k: int = 5) -> None:
+def debug_root_stats(
+    root: SearchNode, 
+    root_state: GameState, 
+    model: nn.Module, 
+    config: SearchConfig, 
+    top_k: int = 5,
+    position_cache_get: Optional[Callable[[GameState], Optional[Tuple[torch.Tensor, float]]]] = None,
+    position_cache_set: Optional[Callable[[GameState, torch.Tensor, float], None]] = None,
+) -> None:
     """Prints top-K moves at root ranked by:
     
     - search visits (N)
@@ -1752,7 +2019,11 @@ def debug_root_stats(root: SearchNode, root_state: GameState, model: nn.Module, 
     from .encoding import legal_mask_4672
     
     device = torch.device(config.device) if isinstance(config.device, str) else config.device
-    policy_logits, _ = evaluate_state_with_model(root_state, model, device)
+    policy_logits, _ = evaluate_state_with_model(
+        root_state, model, device,
+        position_cache_get=position_cache_get,
+        position_cache_set=position_cache_set,
+    )
     
     legal_moves = list(root_state.generate_legal_moves())
     legal_mask = legal_mask_4672(root_state)
