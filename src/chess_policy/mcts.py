@@ -1807,9 +1807,10 @@ def mcts_search(
             for future time manager integration. Currently not fully implemented.
         max_simulations_override: Optional override for number of simulations.
             If provided, overrides config.n_simulations.
-        prev_root_value: Optional value from previous position (from opponent's POV).
-            Used to detect blunders: if current_root_value - prev_root_value > 0.5,
-            we double the simulation budget.
+        prev_root_value: Optional value from previous position (from side-to-move's POV).
+            Both prev_root_value and current_root_value are from the engine's side-to-move POV
+            in their respective positions. Used to detect blunders: if current_root_value - prev_root_value > 0.3,
+            we double the simulation budget (relative to base_sims, respecting max_simulations).
         root_policy_logits: Optional precomputed policy logits for root position.
             If provided, avoids redundant NN evaluation of root. Shape: [POLICY_SIZE].
         root_value: Optional precomputed value for root position.
@@ -1923,29 +1924,29 @@ def mcts_search(
     # BLUNDER-SENSITIVE SIMULATION BUDGET
     # When eval jumps up a lot, we suspect a blunder and invest more search there.
     # If there is no previous value, or the jump is small, we just use the base config.n_simulations.
-    # Determine number of simulations to run
+    # Determine base number of simulations
     if max_simulations_override is not None:
-        n_sims = max_simulations_override
+        base_sims = max_simulations_override
     elif config.fast_mode:
-        n_sims = config.min_simulations
+        base_sims = config.min_simulations
     else:
-        n_sims = config.n_simulations
+        base_sims = config.n_simulations
     
-    # Blunder detection: if value jumped significantly in our favor, double simulations
-    # prev_root_value is from opponent's POV, current_root_value is from our POV
-    # To compare: flip prev_root_value to our POV (opponent's value from their POV -> our POV)
-    # Lower threshold to catch more blunder opportunities (0.3 catches smaller but significant jumps)
+    n_sims = base_sims
+    
+    # Blunder detection: if eval jumps a lot in our favor, invest more sims
+    # Both prev_root_value and current_root_value are already from side-to-move's POV
+    # in their respective positions (for the engine's side), so no sign flip needed
     value_jump_threshold = 0.3
     if prev_root_value is not None:
-        # Flip prev_root_value to our POV (opponent's value from their POV -> our POV)
-        prev_root_value_our_pov = -prev_root_value
-        value_jump = current_root_value - prev_root_value_our_pov
+        # Both values are already from side-to-move's POV in their respective positions
+        value_jump = current_root_value - prev_root_value
         if value_jump > value_jump_threshold:
             # Big jump in eval in our favor => opponent may have blundered
-            # Double the simulation budget to capitalize on the opportunity
-            n_sims = int(config.n_simulations * 2)
+            # Double relative to base, but stay within max_simulations to respect time budget
+            n_sims = min(int(base_sims * 2), config.max_simulations)
     
-    # Clamp to min/max bounds
+    # Clamp final sims to min/max bounds
     n_sims = max(config.min_simulations, min(n_sims, config.max_simulations))
     
     # Adjust max_depth in fast mode if needed (micro-optimization: use local variable instead of rebuilding config)

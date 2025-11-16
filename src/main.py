@@ -64,6 +64,12 @@ OPENING_BOOK_PATH = str(REPO_ROOT / "opening_book.pkl") if (REPO_ROOT / "opening
 VALUE_EARLY_TERMINATION_THRESHOLD = 0.85  # abs(value) above this → skip PUCT (less aggressive for better accuracy)
 VALUE_EARLY_TERMINATION_MIN_PLY = 2       # allow earlier termination (was 4)
 
+# Policy confidence skip: if enabled, skip MCTS when policy is very confident
+# Currently disabled for accuracy - with ~50 sims budget, the extra search is worth it
+# To re-enable: set ENABLE_POLICY_CONFIDENCE_SKIP = True and adjust POLICY_CONFIDENCE_THRESHOLD
+ENABLE_POLICY_CONFIDENCE_SKIP = False  # Disabled for better accuracy
+POLICY_CONFIDENCE_THRESHOLD = 0.55  # If re-enabled, use 0.55 instead of 0.40 for safety
+
 # Debug flags - set to True only when debugging (significantly impacts performance)
 DEBUG_POLICY = False  # Enable verbose policy extraction and diagnostics
 DEBUG_TENSOR = False  # Enable raw tensor diagnostics
@@ -428,11 +434,11 @@ def find_obvious_tactic(board: Board, legal_moves) -> Move | None:
     
     This is a cheap, fast check for obvious tactical wins like:
     - Winning a rook/queen for free
-    - Winning a minor piece for free
-    - Any capture with net gain >= 3 pawns
+    - Winning a minor piece for free (minor for pawn, rook for minor, etc.)
+    - Any capture with net gain >= 2 pawns
     
-    Does NOT check if the captured piece is defended (that would require SEE).
-    This is intentionally simple and fast - catches the most obvious blunders.
+    Checks if the capturing piece would be immediately recaptured to avoid
+    "win a rook, instantly lose the queen" type disasters.
     
     Args:
         board: Current chess board position
@@ -456,9 +462,24 @@ def find_obvious_tactic(board: Board, legal_moves) -> Move | None:
         # Calculate material gain: captured piece value - our piece value
         gain = PIECE_VALUE.get(captured.piece_type, 0) - PIECE_VALUE.get(piece.piece_type, 0)
         
-        # Very naive: just winning material outright (e.g. win a minor/rook/queen for free)
-        # Require gain >= 3 to catch obvious wins (rook for pawn, queen for minor, etc.)
-        if gain >= 3 and gain > best_gain:
+        # Only care about big-ish swings (gain >= 2: minor for pawn, rook for minor, etc.)
+        if gain < 2:
+            continue
+        
+        # Check if the destination square is defended by the opponent after the capture
+        # This avoids "win a rook, instantly lose the queen" type disasters
+        board.push(mv)
+        try:
+            # Is our capturing piece hanging on the new square?
+            attackers = board.attackers(not board.turn, mv.to_square)
+            if attackers:
+                # Capturing piece would be recaptured immediately; skip this as "obvious tactic"
+                continue
+        finally:
+            board.pop()
+        
+        # Found a good capture that won't be immediately recaptured
+        if gain > best_gain:
             best_gain = gain
             best_move = mv
     
@@ -916,10 +937,11 @@ def test_func(ctx: GameContext):
     
     # Policy confidence check: if top policy move has very high probability, skip MCTS
     # BUT: never skip in tactical positions where the net might be overconfident
-    if move_probs and policy_move is not None:
+    # Currently disabled for accuracy - with ~50 sims budget, the extra search is worth it
+    if ENABLE_POLICY_CONFIDENCE_SKIP and move_probs and policy_move is not None:
         top_policy_prob = move_probs.get(policy_move, 0.0)
-        # If top move has >40% probability and no tactical complexity, trust policy (aggressive for bullet)
-        if top_policy_prob > 0.40 and not tactical_heavy:
+        # If top move has high probability (>55% for safety) and no tactical complexity, trust policy
+        if top_policy_prob > POLICY_CONFIDENCE_THRESHOLD and not tactical_heavy:
             policy_confidence_skip = True
             if VERBOSE:
                 print(f"Policy confidence skip: top move has {top_policy_prob*100:.1f}% probability")
@@ -1071,11 +1093,12 @@ def test_func(ctx: GameContext):
     # NEW: Adjust sims based on position clarity (value magnitude)
     # Unclear positions (value ~0) get full search, clear positions (|value| ~1) get reduced search
     # Losing positions get even more aggressive reduction
-    if value is not None and not early_termination:
+    # BUT: Don't shrink sims in tactical chaos – we actually need search there
+    if value is not None and not early_termination and not tactical_heavy:
         scale = value_to_sims_scale(float(value))
         sims_before = sims
         value_float = float(value)
-        abs_value = abs(float(value))
+        abs_value = abs(value_float)
         
         # Increased minimums for better accuracy while still being time-efficient
         if abs_value >= 0.85:
@@ -1090,6 +1113,12 @@ def test_func(ctx: GameContext):
         sims = max(min_sims, int(sims * scale))
         if VERBOSE:
             print(f"Value-aware sims scaling: value={value_float:+.3f}, scale={scale:.2f}, sims {sims_before} → {sims}")
+    elif value is not None and tactical_heavy:
+        # Slight bump for tactical chaos - even +5-10 sims helps with "easy wins in tactics"
+        sims_before = sims
+        sims = max(sims, 18)
+        if VERBOSE and sims > sims_before:
+            print(f"Tactical position: increased sims from {sims_before} to {sims} (tactical_heavy=True)")
     
     # ------------------------------
     # STEP 3: SELECTION STRATEGY (using UCI engine logic)
