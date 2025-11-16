@@ -34,6 +34,21 @@ MODEL_PATH = str(REPO_ROOT / "stockfish_949.pt")
 # Opening book enabled
 OPENING_BOOK_PATH = str(REPO_ROOT / "opening_book.pkl") if (REPO_ROOT / "opening_book.pkl").exists() else None
 
+# Early termination constants for value-based decision skipping
+VALUE_EARLY_TERMINATION_THRESHOLD = 0.85  # abs(value) above this → skip PUCT (lowered for speed)
+VALUE_EARLY_TERMINATION_MIN_PLY = 4       # don't early-terminate in the first few plies
+
+# Debug flags - set to True only when debugging (significantly impacts performance)
+DEBUG_POLICY = False  # Enable verbose policy extraction and diagnostics
+DEBUG_TENSOR = False  # Enable raw tensor diagnostics
+
+# Opening book optimization flags
+OPENING_COMPARE_WITH_MCTS = False  # Enable MCTS comparison between model move and opening book (slower but more accurate)
+OPENING_QUICK_SEARCH = False  # Enable quick MCTS search to find better opening moves (slower but more accurate)
+
+# Time management flags
+LOW_TIME_SKIP_MCTS_MS = 8000  # Skip MCTS entirely when time drops below this (8 seconds, tune this)
+
 print("Loading chess engine model...")
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
@@ -206,6 +221,64 @@ def calculate_game_phase(board):
     return phase
 
 
+def value_to_sims_scale(value: float) -> float:
+    """Convert NN value to a simulation scale factor.
+    
+    Args:
+        value: Evaluation from the perspective of the side to move, in [-1, 1].
+            - abs(value) near 0 → unclear position → scale ~1.0 (full search)
+            - abs(value) near 1 → clearly winning/losing → scale ~0.2 (very reduced search)
+    
+    Returns:
+        Scale factor in [0.2, 1.0] for adjusting simulation count (more aggressive for speed).
+    """
+    abs_value = abs(float(value))
+    
+    # More aggressive scaling: abs_value 0.0 → scale 1.0, abs_value 1.0 → scale 0.2
+    # For very winning positions (abs_value >= 0.85), use even more aggressive scaling
+    if abs_value >= 0.85:
+        scale = 0.15  # Very aggressive for clearly winning/losing positions
+    else:
+        # Linear mapping: abs_value 0.0 → scale 1.0, abs_value 0.85 → scale ~0.32
+        scale = 1.0 - 0.8 * abs_value
+    
+    # Clamp to [0.2, 1.0] to ensure reasonable bounds
+    return max(0.2, min(1.0, scale))
+
+
+def format_value_eval(value: float) -> str:
+    """Convert a value in [-1, 1] to a human-readable string.
+    
+    Args:
+        value: Evaluation from the perspective of the side to move.
+            Range approximately [-1, 1] where 1 = winning, -1 = losing, 0 = equal.
+    
+    Returns:
+        Human-readable string like "Eval: +0.80 (winning for side to move)"
+        or "Eval: -0.95 (losing for side to move)"
+    """
+    if value is None:
+        return "Eval: N/A (no value available)"
+    
+    value_float = float(value)
+    
+    # Determine evaluation description
+    if value_float > 0.5:
+        desc = "strongly winning for side to move"
+    elif value_float > 0.1:
+        desc = "winning for side to move"
+    elif value_float > -0.1:
+        desc = "equal position"
+    elif value_float > -0.5:
+        desc = "losing for side to move"
+    else:
+        desc = "strongly losing for side to move"
+    
+    # Format with sign
+    sign = "+" if value_float >= 0 else ""
+    return f"Eval: {sign}{value_float:.3f} ({desc})"
+
+
 @chess_manager.entrypoint
 def test_func(ctx: GameContext):
     # This gets called every time the model needs to make a move
@@ -229,6 +302,10 @@ def test_func(ctx: GameContext):
 
     # Update engine's board to match current position
     engine.board = ctx.board.copy()
+    
+    # Ensure _recent_positions exists to avoid AttributeError
+    if not hasattr(engine, "_recent_positions"):
+        engine._recent_positions = []
     
     # Try to update search tree if it exists and position changed
     # This handles tree reuse when opponent plays a move
@@ -289,6 +366,10 @@ def test_func(ctx: GameContext):
             if nn_time > 10:  # Only print if it's significant
                 print(f"NN forward (root): {nn_time:.1f} ms")
             
+            # Log the neural network value evaluation (side to move perspective)
+            if value is not None:
+                print(format_value_eval(float(value)))
+            
             # Ensure we got a valid move
             if policy_move is None or policy_move not in legal_moves:
                 print("Warning: choose_move returned invalid move, using first legal move")
@@ -300,10 +381,8 @@ def test_func(ctx: GameContext):
             
             move_probs = {}
             
-            # Get probabilities for legal moves only
-            # The probs_tensor is already normalized over all 4672 indices
-            # We extract probabilities by mapping each legal move to its index
-            if probs_tensor is not None:
+            if DEBUG_POLICY and probs_tensor is not None:
+                # DEBUG MODE: Full extraction of all legal moves (expensive)
                 # Iterate through all legal moves and get their probabilities
                 failed_moves = []
                 for move in legal_move_list:
@@ -339,70 +418,75 @@ def test_func(ctx: GameContext):
                             print(f"  Extracted policy_move prob: {policy_prob:.6f}")
                     except Exception as e:
                         print(f"  Failed to extract policy_move prob: {e}")
-            
-            # The probabilities are already normalized in probs_tensor, but we only extracted legal moves
-            # So they should sum to ~1.0 (minus tiny probabilities on illegal moves)
-            # We don't need to normalize again - the probabilities are correct as-is
-            total_prob = sum(move_probs.values())
-            
-            # Debug: Check probability distribution
-            max_prob = max(move_probs.values()) if move_probs else 0
-            
-            # Always check the raw tensor to see what the model actually output
-            if probs_tensor is not None and move_probs:
-                from .chess_policy.encoding import legal_mask_4672
-                legal_mask = legal_mask_4672(ctx.board)
-                legal_probs_raw = [float(probs_tensor[i].item()) for i in range(len(probs_tensor)) if legal_mask[i] > 0.5]
-                if legal_probs_raw:
-                    legal_max_raw = max(legal_probs_raw)
-                    legal_sum_raw = sum(legal_probs_raw)
-                    print(f"Raw tensor check: max_legal={legal_max_raw:.6f}, sum_legal={legal_sum_raw:.6f}, extracted_max={max_prob:.6f}, extracted_count={len(move_probs)}")
-                    # If there's a big discrepancy, something is wrong with extraction
-                    if abs(legal_max_raw - max_prob) > 0.1:
-                        print(f"WARNING: Raw tensor max ({legal_max_raw:.6f}) doesn't match extracted max ({max_prob:.6f})!")
-            
-            # Debug output to diagnose probability issues
-            # Always print debug info if probabilities are suspiciously uniform/low
-            if max_prob < 0.15 or (max_prob < 0.2 and len(legal_move_list) > 15):
-                print(f"DEBUG: Probabilities seem low/uniform")
-                print(f"  Position: {ctx.board.fen()[:50]}...")
-                print(f"  Extracted probs: max={max_prob:.4f}, sum={total_prob:.4f}, legal_moves={len(legal_move_list)}")
-                # Check if probs_tensor itself has low values
-                if probs_tensor is not None:
-                    probs_max = float(probs_tensor.max().item())
-                    probs_sum = float(probs_tensor.sum().item())
+                
+                # The probabilities are already normalized in probs_tensor, but we only extracted legal moves
+                # So they should sum to ~1.0 (minus tiny probabilities on illegal moves)
+                # We don't need to normalize again - the probabilities are correct as-is
+                total_prob = sum(move_probs.values())
+                
+                # Debug: Check probability distribution
+                max_prob = max(move_probs.values()) if move_probs else 0
+                
+                # Raw tensor diagnostics (only in DEBUG_TENSOR mode)
+                if DEBUG_TENSOR and probs_tensor is not None and move_probs:
+                    from .chess_policy.encoding import legal_mask_4672
                     legal_mask = legal_mask_4672(ctx.board)
                     legal_probs_raw = [float(probs_tensor[i].item()) for i in range(len(probs_tensor)) if legal_mask[i] > 0.5]
-                    legal_max_raw = max(legal_probs_raw) if legal_probs_raw else 0
-                    legal_sum_raw = sum(legal_probs_raw) if legal_probs_raw else 0
-                    print(f"  probs_tensor: max={probs_max:.4f}, sum={probs_sum:.4f}, shape={probs_tensor.shape}")
-                    print(f"  Legal moves in tensor: max={legal_max_raw:.4f}, sum={legal_sum_raw:.4f}, count={len(legal_probs_raw)}")
-                    if legal_sum_raw < 0.5:
-                        print(f"  WARNING: Legal moves sum to only {legal_sum_raw:.4f} - model may not be confident or extraction is wrong!")
-                    if abs(total_prob - legal_sum_raw) > 0.1:
-                        print(f"  WARNING: Extracted probs sum ({total_prob:.4f}) doesn't match legal_sum_raw ({legal_sum_raw:.4f}) - extraction may be incomplete!")
-            
-            # Print top 5 moves with probabilities (for logging/debugging only)
-            # Note: These are extracted probabilities for logging - policy_move is the ground truth
-            sorted_moves = sorted(move_probs.items(), key=lambda x: x[1], reverse=True)
-            top_5 = sorted_moves[:5]
-            print("Top 5 moves from model (for logging):")
-            for i, (move, prob) in enumerate(top_5, 1):
-                marker = "✓" if move == policy_move else " "
-                print(f"  {marker} {i}. {move.uci()}: {prob:.4f} ({prob*100:.2f}%)")
+                    if legal_probs_raw:
+                        legal_max_raw = max(legal_probs_raw)
+                        legal_sum_raw = sum(legal_probs_raw)
+                        print(f"Raw tensor check: max_legal={legal_max_raw:.6f}, sum_legal={legal_sum_raw:.6f}, extracted_max={max_prob:.6f}, extracted_count={len(move_probs)}")
+                        # If there's a big discrepancy, something is wrong with extraction
+                        if abs(legal_max_raw - max_prob) > 0.1:
+                            print(f"WARNING: Raw tensor max ({legal_max_raw:.6f}) doesn't match extracted max ({max_prob:.6f})!")
+                
+                # Debug output to diagnose probability issues (only in DEBUG_TENSOR mode)
+                # Print debug info if probabilities are suspiciously uniform/low
+                if DEBUG_TENSOR and (max_prob < 0.15 or (max_prob < 0.2 and len(legal_move_list) > 15)):
+                    print(f"DEBUG: Probabilities seem low/uniform")
+                    print(f"  Position: {ctx.board.fen()[:50]}...")
+                    print(f"  Extracted probs: max={max_prob:.4f}, sum={total_prob:.4f}, legal_moves={len(legal_move_list)}")
+                    # Check if probs_tensor itself has low values
+                    if probs_tensor is not None:
+                        probs_max = float(probs_tensor.max().item())
+                        probs_sum = float(probs_tensor.sum().item())
+                        from .chess_policy.encoding import legal_mask_4672
+                        legal_mask = legal_mask_4672(ctx.board)
+                        legal_probs_raw = [float(probs_tensor[i].item()) for i in range(len(probs_tensor)) if legal_mask[i] > 0.5]
+                        legal_max_raw = max(legal_probs_raw) if legal_probs_raw else 0
+                        legal_sum_raw = sum(legal_probs_raw) if legal_probs_raw else 0
+                        print(f"  probs_tensor: max={probs_max:.4f}, sum={probs_sum:.4f}, shape={probs_tensor.shape}")
+                        print(f"  Legal moves in tensor: max={legal_max_raw:.4f}, sum={legal_sum_raw:.4f}, count={len(legal_probs_raw)}")
+                        if legal_sum_raw < 0.5:
+                            print(f"  WARNING: Legal moves sum to only {legal_sum_raw:.4f} - model may not be confident or extraction is wrong!")
+                        if abs(total_prob - legal_sum_raw) > 0.1:
+                            print(f"  WARNING: Extracted probs sum ({total_prob:.4f}) doesn't match legal_sum_raw ({legal_sum_raw:.4f}) - extraction may be incomplete!")
+                
+                # Print top 5 moves with probabilities (only in DEBUG_POLICY mode)
+                # Note: These are extracted probabilities for logging - policy_move is the ground truth
+                sorted_moves = sorted(move_probs.items(), key=lambda x: x[1], reverse=True)
+                if DEBUG_POLICY:
+                    top_5 = sorted_moves[:5]
+                    print("Top 5 moves from model (for logging):")
+                    for i, (move, prob) in enumerate(top_5, 1):
+                        marker = "✓" if move == policy_move else " "
+                        print(f"  {marker} {i}. {move.uci()}: {prob:.4f} ({prob*100:.2f}%)")
+            else:
+                # FAST PATH: Only track probability for policy_move (for logs / trust override)
+                if probs_tensor is not None and policy_move is not None:
+                    try:
+                        move_idx = move_to_index(ctx.board, policy_move)
+                        if move_idx is not None and 0 <= move_idx < len(probs_tensor):
+                            move_probs[policy_move] = float(probs_tensor[move_idx].item())
+                    except Exception:
+                        pass
+                # Create empty sorted_moves for compatibility
+                sorted_moves = []
             
             # policy_move from choose_move is the model's actual argmax - this is what we use for selection
             if policy_move is not None:
                 policy_prob = move_probs.get(policy_move, 0.0) if move_probs else 0.0
                 print(f"Using policy_move (model's argmax): {policy_move.uci()} (prob={policy_prob:.4f})")
-
-            # Log probabilities for downstream tooling
-            try:
-                ctx.logProbabilities(move_probs)
-            except Exception as log_err:
-                print(f"Warning: logProbabilities failed: {log_err}")
-                import traceback
-                traceback.print_exc()
         except Exception as e:
             print(f"Warning: Could not compute probabilities: {e}")
             import traceback
@@ -410,13 +494,41 @@ def test_func(ctx: GameContext):
             # Fallback: uniform distribution and use first legal move
             move_probs = {move: 1.0 / len(legal_move_list) for move in legal_move_list}
         sorted_moves = sorted(move_probs.items(), key=lambda x: x[1], reverse=True)
+        # Log probabilities for downstream tooling (handles both success and exception cases)
         try:
             ctx.logProbabilities(move_probs)
         except Exception as log_err:
-            print(f"Warning: logProbabilities failed after exception: {log_err}")
+            print(f"Warning: logProbabilities failed: {log_err}")
         # Ensure policy_move is set to a valid move
         if policy_move is None or policy_move not in legal_moves:
             policy_move = legal_move_list[0]
+    
+    # ------------------------------
+    # EARLY TERMINATION CHECK (based on NN value)
+    # ------------------------------
+    # NEW: Check if position is "decided" based on extreme value magnitude
+    # Guardrails: Don't skip search in tactical positions (checks, many forcing moves)
+    early_termination = False
+    
+    # Compute tactical indicators
+    num_check_moves = sum(1 for m in legal_move_list if ctx.board.gives_check(m))
+    in_check = ctx.board.is_check()
+    
+    print(f"Checks available: {num_check_moves}; in_check={in_check}")
+    
+    # Early termination conditions:
+    # 1. Value must be available
+    # 2. Must be past minimum ply
+    # 3. Value magnitude must be extreme
+    # 4. Not in check (tactical)
+    # 5. Not too many check moves available (tactical)
+    if value is not None and current_ply >= VALUE_EARLY_TERMINATION_MIN_PLY:
+        if abs(float(value)) >= VALUE_EARLY_TERMINATION_THRESHOLD:
+            if not in_check and num_check_moves < 3:
+                early_termination = True
+                print(f"Early termination triggered (value={float(value):+.3f})")
+            else:
+                print("Skipping early termination due to tactical complexity")
     
     # ------------------------------
     # STEP 2: CONFIGURE SEARCH BUDGET
@@ -430,10 +542,12 @@ def test_func(ctx: GameContext):
     # Calculate simulations based on time and game phase
     # Default sims from engine config
     sims = engine.sims
-    if ctx.timeLeft > 0:
+    # Set default movetime_ms to avoid UnboundLocalError when ctx.timeLeft <= 0
+    movetime_ms = ctx.timeLeft if ctx.timeLeft and ctx.timeLeft > 0 else 0
+    
+    if movetime_ms > 0:
         # Dynamic time management: adapt simulations based on available time
         # Optimized for 1-minute games: very conservative time usage
-        movetime_ms = ctx.timeLeft
         
         # For 1-minute games, be very conservative with time usage
         # Estimate moves remaining (assume ~35-40 moves per game for 1-min)
@@ -459,21 +573,21 @@ def test_func(ctx: GameContext):
         time_budget_ms = time_per_move_ms * 0.75
         estimated_sims = max(15, int(time_budget_ms * sims_per_sec / 1000.0))
         
-        # Cap simulations based on time remaining (optimized for speed)
+        # Cap simulations based on time remaining (aggressively optimized for speed)
         if movetime_ms > 40000:  # >40 seconds left (early game)
-            max_sims = 120  # Reduced from 150
+            max_sims = 90  # Reduced from 120
         elif movetime_ms > 25000:  # 25-40 seconds
-            max_sims = 100  # Reduced from 120
+            max_sims = 75  # Reduced from 100
         elif movetime_ms > 15000:  # 15-25 seconds
-            max_sims = 80  # Reduced from 100
+            max_sims = 60  # Reduced from 80
         elif movetime_ms > 8000:  # 8-15 seconds
-            max_sims = 65  # Reduced from 80
+            max_sims = 45  # Reduced from 65
         elif movetime_ms > 4000:  # 4-8 seconds
-            max_sims = 50  # Reduced from 60
+            max_sims = 35  # Reduced from 50
         elif movetime_ms > 2000:  # 2-4 seconds
-            max_sims = 35  # Reduced from 40
+            max_sims = 25  # Reduced from 35
         else:  # <2 seconds: critical time
-            max_sims = 20  # Reduced from 25
+            max_sims = 15  # Reduced from 20
         
         sims = min(estimated_sims, max_sims)
         
@@ -486,42 +600,71 @@ def test_func(ctx: GameContext):
             sims = min(sims, 30)  # Reduced from 35
         if movetime_ms < 2000:  # Less than 2 seconds
             sims = min(sims, 18)  # Reduced from 20
+    else:
+        # No time info available - use conservative defaults
+        sims = min(sims, 80)  # Safe cap when time info unavailable
     
     # Phase-aware adjustments (optimized for speed while maintaining accuracy)
     # Strategy: Trust policy more, reduce search in all phases for faster moves
     # TUNE: Adjust phase-specific parameters if blunders occur in specific phases
     if game_phase > 0.7:  # Opening
-        sims = min(sims, 65)  # Reduced from 80 - opening is usually book moves
+        sims = min(sims, 50)  # Reduced from 65 - opening is usually book moves
         if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
             engine.mcts_config.c_puct = 0.8  # Reduced from 1.0 - trust policy more
     elif game_phase < 0.3:  # Endgame
         # In endgame, be very efficient - trust policy heavily
-        if movetime_ms < 8000:  # Less than 8 seconds: time pressure
+        if movetime_ms > 0:
+            if movetime_ms < 8000:  # Less than 8 seconds: time pressure
+                sims = min(sims, 40)  # Reduced from 50
+                if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
+                    engine.mcts_config.c_puct = 0.4  # Trust policy very heavily in time trouble
+            elif movetime_ms < 15000:  # 8-15 seconds: moderate time
+                sims = min(sims, 50)  # Reduced from 60
+                if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
+                    engine.mcts_config.c_puct = 0.45  # Reduced from 0.5 - trust policy more
+            else:  # >15 seconds: can search more
+                sims = min(sims, 60)  # Reduced from 75
+                if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
+                    engine.mcts_config.c_puct = 0.45  # Reduced from 0.5
+        else:
+            # No time info - use safe defaults for endgame
             sims = min(sims, 50)  # Reduced from 60
             if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
-                engine.mcts_config.c_puct = 0.4  # Trust policy very heavily in time trouble
-        elif movetime_ms < 15000:  # 8-15 seconds: moderate time
-            sims = min(sims, 60)  # Reduced from 70
+                engine.mcts_config.c_puct = 0.45
+    else:  # Midgame - prioritize speed, especially in winning positions
+        # Midgame: be very fast, trust policy more
+        if movetime_ms > 0:
+            if movetime_ms > 30000:  # Plenty of time: still prioritize speed
+                sims = min(sims, 80)  # Reduced from 110 - faster moves
+                if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
+                    engine.mcts_config.c_puct = 0.5  # Trust policy more
+            elif movetime_ms > 15000:  # Moderate time: be fast
+                sims = min(sims, 55)  # Reduced from 80
+                if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
+                    engine.mcts_config.c_puct = 0.5  # Trust policy more
+            else:  # Time pressure: minimal search
+                sims = min(sims, 40)  # Reduced from 60
+                if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
+                    engine.mcts_config.c_puct = 0.45  # Trust policy heavily
+        else:
+            # No time info - use safe defaults for midgame
+            sims = min(sims, 55)  # Reduced from 75
             if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
-                engine.mcts_config.c_puct = 0.45  # Reduced from 0.5 - trust policy more
-        else:  # >15 seconds: can search more
-            sims = min(sims, 75)  # Reduced from 90
-            if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
-                engine.mcts_config.c_puct = 0.45  # Reduced from 0.5
-    else:  # Midgame - balance speed and accuracy
-        # Midgame is critical but we need to be faster - use moderate search
-        if movetime_ms > 30000:  # Plenty of time: search carefully but efficiently
-            sims = min(sims, 140)  # Reduced from 200 - still good search but faster
-            if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
-                engine.mcts_config.c_puct = 0.55  # Reduced from 0.6 - trust policy more
-        elif movetime_ms > 15000:  # Moderate time: balanced
-            sims = min(sims, 100)  # Reduced from 120
-            if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
-                engine.mcts_config.c_puct = 0.55  # Reduced from 0.6
-        else:  # Time pressure: reduce but still careful
-            sims = min(sims, 75)  # Reduced from 90
-            if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
-                engine.mcts_config.c_puct = 0.5  # Trust policy more when time is low
+                engine.mcts_config.c_puct = 0.5
+    
+    # ------------------------------
+    # VALUE-AWARE SIMS SCALING
+    # ------------------------------
+    # NEW: Adjust sims based on position clarity (value magnitude)
+    # Unclear positions (value ~0) get full search, clear positions (|value| ~1) get reduced search
+    if value is not None and not early_termination:
+        scale = value_to_sims_scale(float(value))
+        sims_before = sims
+        # More aggressive minimum: 10 sims for very winning positions, 15 for others
+        abs_value = abs(float(value))
+        min_sims = 10 if abs_value >= 0.85 else 15
+        sims = max(min_sims, int(sims * scale))
+        print(f"Value-aware sims scaling: value={float(value):+.3f}, scale={scale:.2f}, sims {sims_before} → {sims}")
     
     # ------------------------------
     # STEP 3: SELECTION STRATEGY (using UCI engine logic)
@@ -608,7 +751,8 @@ def test_func(ctx: GameContext):
             # Increased threshold from 0.3 to 0.35 to reduce unnecessary comparisons
             if top_model_move is not None and top_model_move != mv and top_model_prob > 0.35:
                 # Model is confident in a different move - compare with opening book using MCTS
-                if engine.use_puct and hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
+                # Only do MCTS comparison if explicitly enabled (disabled by default for speed)
+                if OPENING_COMPARE_WITH_MCTS and engine.use_puct and hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
                     # Quick evaluation of both moves using MCTS - reduced sims for speed
                     from .chess_policy.mcts import SearchTree, SearchConfig
                     quick_config = SearchConfig(
@@ -660,7 +804,8 @@ def test_func(ctx: GameContext):
             
             # If we have MCTS available, do a quick search to see if there's a better move
             # This catches subtle advantages that the simple tactical check might miss
-            if engine.use_puct and hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
+            # Only do quick search if explicitly enabled (disabled by default for speed)
+            if OPENING_QUICK_SEARCH and engine.use_puct and hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
                 # Quick search with fewer simulations (30-70) to compare with opening book - reduced for speed
                 quick_sims = min(70, max(30, engine.sims // 5))  # Reduced from 50-100 and //4 to //5
                 from .chess_policy.mcts import SearchTree, SearchConfig
@@ -726,7 +871,10 @@ def test_func(ctx: GameContext):
             return move
         
         # Use model/MCTS for non-opening positions
-        if engine.use_puct and hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
+        # NEW: Skip PUCT if early termination is triggered (extreme value magnitude)
+        # NEW: Skip MCTS if low on time (use greedy policy for speed)
+        skip_mcts_for_time = movetime_ms > 0 and movetime_ms < LOW_TIME_SKIP_MCTS_MS
+        if not early_termination and not skip_mcts_for_time and engine.use_puct and hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
             decision_mode = "MCTS search"
             print(f"Decision mode: {decision_mode} (ply {current_ply}, phase={game_phase:.2f})")
             
@@ -806,15 +954,40 @@ def test_func(ctx: GameContext):
                     engine.search_tree = None
         else:
             # Use greedy policy selection (fast, no search)
-            decision_mode = "Greedy policy"
-            print(f"Decision mode: {decision_mode} (ply {current_ply})")
-            try:
-                mv, _, _ = choose_move(ctx.board, model, device=device, temperature=0.8, sample=False)
-                move = mv
-            except Exception as e:
-                # Fallback if choose_move fails
-                print(f"info string Error in greedy selection: {e}", file=sys.stderr)
-                move = next(iter(ctx.board.legal_moves), None)
+            # NEW: Handle early termination case with special logging
+            if early_termination:
+                decision_mode = "Greedy policy (early termination)"
+                print(f"Decision mode: {decision_mode} (value={float(value):+.3f}, ply {current_ply})")
+                # Prefer sorted_moves[0][0] if available, otherwise fallback to policy_move
+                if sorted_moves and len(sorted_moves) > 0:
+                    move = sorted_moves[0][0]
+                    print(f"Using top policy move from sorted_moves: {move.uci()}")
+                elif policy_move is not None and policy_move in legal_moves:
+                    move = policy_move
+                    print(f"Using policy_move: {move.uci()}")
+                else:
+                    move = legal_move_list[0]
+                    print(f"Fallback to first legal move: {move.uci()}")
+            elif skip_mcts_for_time:
+                decision_mode = "Greedy policy (low time)"
+                print(f"Decision mode: {decision_mode} (movetime_ms={movetime_ms}, ply {current_ply})")
+                try:
+                    mv, _, _ = choose_move(ctx.board, model, device=device, temperature=0.8, sample=False)
+                    move = mv
+                except Exception as e:
+                    # Fallback if choose_move fails
+                    print(f"info string Error in greedy selection: {e}", file=sys.stderr)
+                    move = next(iter(ctx.board.legal_moves), None)
+            else:
+                decision_mode = "Greedy policy"
+                print(f"Decision mode: {decision_mode} (ply {current_ply})")
+                try:
+                    mv, _, _ = choose_move(ctx.board, model, device=device, temperature=0.8, sample=False)
+                    move = mv
+                except Exception as e:
+                    # Fallback if choose_move fails
+                    print(f"info string Error in greedy selection: {e}", file=sys.stderr)
+                    move = next(iter(ctx.board.legal_moves), None)
         
         # Fallback if selected move is invalid
         if move is None or move not in legal_moves:
@@ -842,6 +1015,10 @@ def test_func(ctx: GameContext):
         print(f"Final decision mode: {decision_mode}")
         print(f"Selected move: {move.uci()}")
         
+        # Log position assessment using NN value
+        if value is not None:
+            print("Position assessment:", format_value_eval(float(value)))
+        
         # Log probability for debugging (from our extracted move_probs, which is best-effort)
         if move_probs and move in move_probs:
             move_prob = move_probs[move]
@@ -864,7 +1041,10 @@ def reset_func(ctx: GameContext):
     # This gets called when a new game begins
     # Should do things like clear caches, reset model state, etc.
     print("Resetting chess engine for new game...")
-    engine.ucinewgame()  # This resets the board and clears caches
+    if engine is not None:
+        engine.ucinewgame()  # This resets the board and clears caches
+    else:
+        print("Warning: engine is None in reset_func; skipping ucinewgame()")
     # Clear the FEN cache to avoid memory buildup
     _cached_nn_eval.cache_clear()
     print("Chess engine reset complete")
