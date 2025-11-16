@@ -1997,14 +1997,14 @@ def mcts_search(
     # (SearchTree provides one for cross-search caching)
     if batch_evaluator is None:
         device = torch.device(config.device) if isinstance(config.device, str) else config.device
-        # Optimized batch size heuristic: larger batches for better GPU utilization
-        # Larger batches = better GPU efficiency, less overhead
+        # Optimized batch size heuristic: smaller batches for faster individual evaluations
+        # Smaller batches = lower latency per evaluation = faster moves
         if device.type == "cuda":
-            # Use larger batches for GPU: up to 128 for better throughput
-            # More aggressive batching = fewer kernel launches = faster
-            batch_size = min(128, max(16, n_sims // 2))
+            # Use smaller batches for GPU: faster individual evaluations
+            # Smaller batches = less waiting = faster moves
+            batch_size = min(64, max(8, n_sims // 3))  # Reduced from 128 and //2 for speed
         else:
-            batch_size = min(32, max(4, n_sims // 4))  # CPU: moderate batches
+            batch_size = min(16, max(2, n_sims // 6))  # CPU: smaller batches for speed
         batch_evaluator = BatchEvaluator(model, device, batch_size=batch_size)
     
     # Run simulations with batch inference
@@ -2012,9 +2012,9 @@ def mcts_search(
     # We periodically flush batches during search for better GPU utilization
     start_time = time.time() if available_time_ms is not None else None
     
-    # Batch flush interval: evaluate batches every N simulations for better throughput
-    # This ensures we don't wait too long before batching, improving GPU utilization
-    batch_flush_interval = max(1, batch_evaluator.batch_size // 4) if batch_evaluator else 16
+    # Batch flush interval: evaluate batches more frequently for lower latency
+    # More frequent flushes = faster individual evaluations = faster moves
+    batch_flush_interval = max(1, batch_evaluator.batch_size // 2) if batch_evaluator else 8  # More frequent for speed
     
     for sim_idx in range(n_sims):
         # Check time budget if provided (basic implementation)
