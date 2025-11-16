@@ -95,8 +95,8 @@ torch.set_grad_enabled(False)
 engine = UciEngine(
     model,
     use_puct=True,
-    sims=120,  # Reduced default simulations for faster moves
-    c_puct=1.2,  # PUCT exploration constant
+    sims=200,  # Increased simulations for better convergence
+    c_puct=0.8,  # Lower PUCT to trust policy more, less exploration
     device=device,
     opening_book_path=OPENING_BOOK_PATH,
     opening_max_ply=8,
@@ -399,13 +399,13 @@ def test_func(ctx: GameContext):
         if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
             engine.mcts_config.c_puct = 1.4
     elif game_phase < 0.3:  # Endgame
-        sims = min(sims, 100)
-        if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
-            engine.mcts_config.c_puct = 0.9
-    else:  # Midgame
         sims = min(sims, 150)
         if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
-            engine.mcts_config.c_puct = 1.2
+            engine.mcts_config.c_puct = 0.7  # Lower in endgame - trust policy more
+    else:  # Midgame
+        sims = min(sims, 200)
+        if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
+            engine.mcts_config.c_puct = 0.8  # Lower to trust policy more
     
     # ------------------------------
     # STEP 3: SELECTION STRATEGY (using UCI engine logic)
@@ -615,6 +615,21 @@ def test_func(ctx: GameContext):
             mv, visit_dist, root_value = engine.search_tree.search(max_simulations_override=sims)
             search_time = (time.monotonic() - search_start) * 1000
             print(f"Search: {search_time:.1f} ms (sims={sims})")
+            
+            # Policy trust check: if top policy move has much higher probability than MCTS choice,
+            # and MCTS choice has low policy probability, trust the policy instead
+            if mv is not None and policy_move is not None:
+                mcts_policy_prob = move_probs.get(mv, 0.0) if move_probs else 0.0
+                top_policy_prob = move_probs.get(policy_move, 0.0) if move_probs else 0.0
+                
+                # If top policy move has >3x the probability of MCTS choice, and MCTS choice is <5%,
+                # trust the policy (likely MCTS is exploring a bad line)
+                if top_policy_prob > 0.15 and mcts_policy_prob < 0.05 and top_policy_prob > mcts_policy_prob * 3.0:
+                    print(f"Policy trust override: MCTS chose {mv.uci()} (prob={mcts_policy_prob:.4f}), "
+                          f"but policy top move {policy_move.uci()} has prob={top_policy_prob:.4f} "
+                          f"({top_policy_prob/mcts_policy_prob:.1f}x higher). Using policy move.")
+                    mv = policy_move
+                    decision_mode = "Policy trust override"
             
             # If move would lead to a position we've seen recently, try to avoid it
             if mv is not None:
