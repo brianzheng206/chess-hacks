@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Protocol, Tuple, TYPE_CHECKING, Optional, Dict, Any
 import math
+import threading
 
 import torch
 import torch.nn as nn
@@ -214,6 +215,13 @@ class SearchNode:
     
     Properties:
         q_value: Average value estimate Q(s,a) = value_sum / visit_count, or 0.0 if unvisited.
+    
+    Thread-safety:
+        Currently NOT thread-safe. For parallel MCTS, you would need:
+        - Locks or atomic operations on visit_count and value_sum
+        - Virtual loss mechanism to prevent multiple threads from exploring the same path
+        - Thread-safe children dictionary access
+        - See BatchEvaluator docstring for more details on parallel MCTS requirements.
     """
     
     def __init__(
@@ -348,6 +356,16 @@ class SearchTree:
         # This enables automatic "double sims on eval spike" move-to-move
         self.prev_root_value: float | None = None
         
+        # Reusable batch evaluator for cross-search caching
+        # This allows cache hits across multiple search calls (e.g., similar positions)
+        device = torch.device(config.device) if isinstance(config.device, str) else config.device
+        # Better batch size heuristic: larger batches for GPU
+        if device.type == "cuda":
+            batch_size = min(64, max(8, config.n_simulations // 2))  # GPU: prefer larger batches
+        else:
+            batch_size = min(16, max(4, config.n_simulations // 4))  # CPU: smaller is okay
+        self.batch_evaluator = BatchEvaluator(model, device, batch_size=batch_size)
+        
         # Determine to_play from root_state
         to_play = 1  # Default to white
         if hasattr(root_state, 'turn'):
@@ -433,6 +451,7 @@ class SearchTree:
         
         Automatically tracks prev_root_value for blunder detection, enabling
         "double sims on eval spike" to work move-to-move without external tracking.
+        Uses the shared batch evaluator for cross-search caching.
         
         Args:
             available_time_ms: Optional time budget in milliseconds. If provided,
@@ -452,6 +471,7 @@ class SearchTree:
             available_time_ms=available_time_ms,
             max_simulations_override=max_simulations_override,
             prev_root_value=self.prev_root_value,
+            batch_evaluator=self.batch_evaluator,  # Reuse batch evaluator for cross-search caching
         )
         # Store current root value for next search (blunder detection)
         self.prev_root_value = current_root_value
@@ -547,15 +567,256 @@ def select_child(node: SearchNode, c_puct: float, config: Optional[SearchConfig]
     return best_move, best_child
 
 
+class BatchEvaluator:
+    """Batch evaluator for efficient neural network inference during MCTS.
+    
+    Collects states that need evaluation and processes them in batches for better GPU utilization.
+    This is similar to the batch inference approach used in AlphaZero training.
+    
+    Thread-safety:
+        - This class uses locks to protect shared state (pending_states, results_cache, stats).
+        - Currently, MCTS search is single-threaded, so these locks are primarily future-proofing.
+        - Locks are cheap and don't hurt performance in single-threaded mode.
+    
+    Parallel MCTS (future work):
+        For true parallel MCTS with multiple threads running run_simulation() concurrently, you would need:
+        
+        1. Tree-safe parallel MCTS:
+           - Virtual loss: When a worker picks a path, temporarily increment visit_count and subtract
+             a "virtual loss" from value_sum to discourage other workers from the same path.
+           - Locks or atomic operations on:
+             * visit_count updates
+             * value_sum updates  
+             * children creation/expansion
+           - Pattern: Each thread locks nodes as it traverses, adds virtual loss before evaluation,
+             then removes virtual loss and adds actual value after backup.
+        
+        2. Ray actor integration (optional, for distributed evaluation):
+           - Ray actor would own the model instance on GPU
+           - BatchEvaluator would encode boards locally, send to actor.evaluate_batch.remote(),
+             wait for results, then update cache
+           - Note: For single GPU setups, Ray is often overkill - single-process batching is usually
+             sufficient and simpler.
+        
+        This class is ready for parallel evaluation, but SearchNode tree operations are not yet
+        thread-safe. See open-source AlphaZero/LC0 implementations for reference.
+    """
+    
+    def __init__(self, model: nn.Module, device: torch.device | str, batch_size: int = 32):
+        """Initialize batch evaluator.
+        
+        Args:
+            model: Neural network model for evaluation.
+            device: PyTorch device for inference.
+            batch_size: Maximum batch size for evaluation (default: 32).
+        """
+        self.model = model
+        self.device = device
+        self.batch_size = batch_size
+        
+        # Thread-safe data structures (locks are cheap, provide safety for future multi-threading)
+        self._lock = threading.Lock()  # Lock for thread-safe access to shared state
+        self.pending_states: list[Tuple[GameState, object]] = []  # (state, callback_data)
+        self.results_cache: Dict[str, Tuple[torch.Tensor, float]] = {}  # FEN -> (logits, value)
+        self.stats_batched = 0  # Number of states evaluated in batches
+        self.stats_single = 0  # Number of states evaluated individually
+        self.stats_cached = 0  # Number of cache hits
+        
+    def add_state(self, state: GameState, callback_data: object = None) -> None:
+        """Add a state to the evaluation queue.
+        
+        Thread-safe: Uses lock to prevent race conditions.
+        
+        Args:
+            state: Game state to evaluate.
+            callback_data: Optional data to associate with this state (e.g., node reference).
+        """
+        # Use FEN as cache key
+        fen = state.fen() if hasattr(state, 'fen') else str(state)
+        with self._lock:
+            if fen not in self.results_cache:
+                self.pending_states.append((state, callback_data))
+    
+    def evaluate_batch(self) -> None:
+        """Evaluate all pending states in a batch and cache results.
+        
+        Thread-safe: Uses lock to prevent race conditions during evaluation.
+        Optimized for GPU: minimizes CPU-GPU transfers and keeps tensors on GPU longer.
+        """
+        # Thread-safe: acquire lock and copy pending states
+        with self._lock:
+            if not self.pending_states:
+                return
+            # Copy pending states to avoid holding lock during evaluation
+            states_to_evaluate = self.pending_states.copy()
+            self.pending_states.clear()
+        
+        from .encoding import board_to_tensor, NUM_FEATURE_PLANES
+        from .infer import unpack_policy
+        
+        # Process in batches (using copied list, no lock needed during evaluation)
+        for batch_start in range(0, len(states_to_evaluate), self.batch_size):
+            batch_end = min(batch_start + self.batch_size, len(states_to_evaluate))
+            batch_states = states_to_evaluate[batch_start:batch_end]
+            
+            # Encode all states in batch (CPU encoding, but we'll move to GPU in one go)
+            batch_tensors = []
+            batch_fens = []
+            
+            # Get model's expected channel count once
+            try:
+                c_model = int(getattr(self.model, "in_channels", None) or NUM_FEATURE_PLANES)
+            except Exception:
+                c_model = NUM_FEATURE_PLANES
+            
+            for state, _ in batch_states:
+                # Encode board to tensor [C, 8, 8]
+                x_np = board_to_tensor(state)
+                c_encoded = x_np.shape[0]
+                
+                # Align channels to model's expected input
+                if c_encoded > c_model:
+                    x_np = x_np[:c_model]
+                elif c_encoded < c_model:
+                    pad = np.zeros((c_model - c_encoded, x_np.shape[1], x_np.shape[2]), dtype=x_np.dtype)
+                    x_np = np.concatenate([x_np, pad], axis=0)
+                
+                batch_tensors.append(x_np)
+                fen = state.fen() if hasattr(state, 'fen') else str(state)
+                batch_fens.append(fen)
+            
+            # Stack into batch tensor [B, C, 8, 8] and move to GPU in one operation
+            batch_x = np.stack(batch_tensors, axis=0)
+            # Use non_blocking=True for faster CPU->GPU transfer
+            x = torch.from_numpy(batch_x).to(self.device, non_blocking=True)
+            
+            # Run model on batch (all on GPU)
+            self.model.eval()
+            with torch.no_grad():
+                output = self.model(x)
+                logits_batch, v_pred_batch = unpack_policy(output)
+                
+                # Extract values - keep on GPU as long as possible
+                if v_pred_batch is not None:
+                    if v_pred_batch.dim() == 2:
+                        values_tensor = v_pred_batch.squeeze(-1)  # Keep on GPU
+                    else:
+                        values_tensor = v_pred_batch
+                else:
+                    values_tensor = torch.zeros(len(batch_states), device=self.device)
+                
+                # Process results - move to CPU only when necessary for caching
+                # Batch the CPU transfer for better efficiency
+                values_cpu = values_tensor.cpu().numpy()
+                logits_cpu = logits_batch.cpu()  # Move entire batch to CPU at once
+                
+                # Cache results for each state (now using CPU tensors)
+                # Thread-safe: acquire lock to update cache
+                with self._lock:
+                    for i, fen in enumerate(batch_fens):
+                        logits = logits_cpu[i]
+                        value = float(values_cpu[i])
+                        self.results_cache[fen] = (logits, value)
+                    
+                    # Update stats
+                    self.stats_batched += len(batch_states)
+    
+    def get_stats(self) -> Dict[str, int]:
+        """Get statistics about batch evaluation.
+        
+        Thread-safe: Uses lock to prevent race conditions.
+        """
+        with self._lock:
+            return {
+                'batched': self.stats_batched,
+                'single': self.stats_single,
+                'cached': self.stats_cached,
+                'total': self.stats_batched + self.stats_single + self.stats_cached
+            }
+    
+    def get_result(self, state: GameState) -> Optional[Tuple[torch.Tensor, float]]:
+        """Get cached result for a state.
+        
+        Thread-safe: Uses lock to prevent race conditions.
+        
+        Args:
+            state: Game state to look up.
+            
+        Returns:
+            Tuple of (logits, value) if cached, None otherwise.
+        """
+        fen = state.fen() if hasattr(state, 'fen') else str(state)
+        with self._lock:
+            return self.results_cache.get(fen)
+    
+    def get_result_and_mark_cached(self, state: GameState) -> Optional[Tuple[torch.Tensor, float]]:
+        """Get cached result for a state and increment cache hit stats if found.
+        
+        Thread-safe: Uses lock to prevent race conditions.
+        
+        Args:
+            state: Game state to look up.
+            
+        Returns:
+            Tuple of (logits, value) if cached, None otherwise.
+        """
+        fen = state.fen() if hasattr(state, 'fen') else str(state)
+        with self._lock:
+            res = self.results_cache.get(fen)
+            if res is not None:
+                self.stats_cached += 1
+            return res
+    
+    def should_eval_now(self) -> bool:
+        """Check if batch should be evaluated now based on pending states.
+        
+        Thread-safe: Uses lock to prevent race conditions.
+        
+        Returns:
+            True if batch is full or has at least 2 states (for better GPU utilization), False otherwise.
+            Lower threshold (2 instead of 4) to batch more aggressively and reduce single evaluations.
+        """
+        with self._lock:
+            pending_count = len(self.pending_states)
+            return pending_count >= self.batch_size or pending_count >= 2
+    
+    def _cache_result(self, state: GameState, logits: torch.Tensor, value: float, is_single: bool = False) -> None:
+        """Cache a result for a state.
+        
+        Thread-safe: Uses lock to prevent race conditions.
+        
+        Args:
+            state: Game state to cache.
+            logits: Policy logits tensor.
+            value: Value prediction.
+            is_single: If True, increment single evaluation stats.
+        """
+        fen = state.fen() if hasattr(state, 'fen') else str(state)
+        with self._lock:
+            self.results_cache[fen] = (logits, value)
+            if is_single:
+                self.stats_single += 1
+    
+    def clear_cache(self) -> None:
+        """Clear the results cache.
+        
+        Thread-safe: Uses lock to prevent race conditions.
+        """
+        with self._lock:
+            self.results_cache.clear()
+            self.pending_states.clear()
+
+
 def evaluate_state_with_model(
     state: GameState,
     model: nn.Module,
     device: torch.device | str,
+    batch_evaluator: Optional[BatchEvaluator] = None,
 ) -> Tuple[torch.Tensor, float]:
     """Evaluate a game state using the neural network model.
     
     Encodes the state into the model's input format, runs the model, and returns
-    policy logits and value prediction.
+    policy logits and value prediction. Can use batch evaluator for efficiency.
     
     Args:
         state: Game state to evaluate (must implement GameState protocol).
@@ -564,6 +825,8 @@ def evaluate_state_with_model(
             - policy_logits: [B, POLICY_SIZE] = [B, 4672] tensor
             - value: [B, 1] tensor in range [-1, 1]
         device: PyTorch device for model inference.
+        batch_evaluator: Optional BatchEvaluator for batch inference. If provided,
+            the state will be added to the batch queue instead of evaluated immediately.
     
     Returns:
         A tuple of:
@@ -575,6 +838,28 @@ def evaluate_state_with_model(
     The encoding handles channel alignment automatically to support models
     trained with different numbers of input channels (e.g., 18 vs 25).
     """
+    # If batch evaluator is provided, use it for batching
+    if batch_evaluator is not None:
+        # Check cache and mark as cached if found (thread-safe)
+        cached_result = batch_evaluator.get_result_and_mark_cached(state)
+        if cached_result is not None:
+            return cached_result
+        
+        # Add to batch queue (thread-safe)
+        batch_evaluator.add_state(state)
+        
+        # Check if we should evaluate now (thread-safe)
+        if batch_evaluator.should_eval_now():
+            batch_evaluator.evaluate_batch()
+            # Get result after batch evaluation (thread-safe, but don't double-count cache hit)
+            cached_result = batch_evaluator.get_result(state)
+            if cached_result is not None:
+                return cached_result
+        
+        # If we only have 1 state and batch isn't full, we still need to evaluate it
+        # But try to wait a bit - the periodic evaluation should catch it
+        # For now, fall through to single eval only as last resort
+    
     from .encoding import board_to_tensor, NUM_FEATURE_PLANES
     from .infer import unpack_policy
     
@@ -617,6 +902,10 @@ def evaluate_state_with_model(
                 v = v[0]
             value = float(v.squeeze(-1).cpu().item())
     
+    # Cache result if batch evaluator is provided (thread-safe)
+    if batch_evaluator is not None:
+        batch_evaluator._cache_result(state, logits.cpu(), value, is_single=True)
+    
     return logits.cpu(), value
 
 
@@ -625,6 +914,7 @@ def expand_node(
     state: GameState,
     model: nn.Module,
     config: SearchConfig,
+    batch_evaluator: Optional[BatchEvaluator] = None,
 ) -> float:
     """Expand a search node by evaluating it with the neural network.
     
@@ -708,7 +998,7 @@ def expand_node(
     # Only reach here if state.is_game_over() is False
     # The neural network value is from the POV of state.turn (the side to move) in [-1, 1]
     device = torch.device(config.device) if isinstance(config.device, str) else config.device
-    policy_logits, value = evaluate_state_with_model(state, model, device)
+    policy_logits, value = evaluate_state_with_model(state, model, device, batch_evaluator)
     
     # Get legal moves and build mask
     legal_moves = list(state.generate_legal_moves())
@@ -806,6 +1096,7 @@ def run_simulation(
     root_state: GameState,
     model: nn.Module,
     config: SearchConfig,
+    batch_evaluator: Optional[BatchEvaluator] = None,
 ) -> None:
     """Run a single MCTS simulation starting at root.
     
@@ -894,7 +1185,7 @@ def run_simulation(
     else:
         # Expand the leaf node
         # expand_node returns value from the POV of the player to move at the leaf
-        leaf_value = expand_node(node, leaf_state, model, config)
+        leaf_value = expand_node(node, leaf_state, model, config, batch_evaluator)
     
     # Ensure we have a valid value
     if leaf_value is None:
@@ -937,6 +1228,7 @@ def mcts_search(
     available_time_ms: Optional[float] = None,
     max_simulations_override: Optional[int] = None,
     prev_root_value: Optional[float] = None,
+    batch_evaluator: Optional[BatchEvaluator] = None,
 ) -> Tuple[AnyMoveType, torch.Tensor, float]:
     """Run MCTS with PUCT starting from root_state.
     
@@ -1141,10 +1433,22 @@ def mcts_search(
         for i, (move, child) in enumerate(root.children.items()):
             child.prior = (1.0 - frac) * original_priors[i] + frac * dirichlet_noise[i]
     
-    # Run simulations
-    # TODO: Implement full time manager that checks available_time_ms during loop
-    # For now, structure is here for easy integration later
+    # Use provided batch evaluator or create a new one if not provided
+    # (SearchTree provides one for cross-search caching)
+    if batch_evaluator is None:
+        device = torch.device(effective_config.device) if isinstance(effective_config.device, str) else effective_config.device
+        # Better batch size heuristic: larger batches for GPU
+        if device.type == "cuda":
+            batch_size = min(64, max(8, n_sims // 2))  # GPU: prefer larger batches
+        else:
+            batch_size = min(16, max(4, n_sims // 4))  # CPU: smaller is okay
+        batch_evaluator = BatchEvaluator(model, device, batch_size=batch_size)
+    
+    # Run simulations with batch inference
+    # Batching happens automatically in evaluate_state_with_model when should_eval_now() is true
+    # We only need to flush remaining states at the end
     start_time = time.time() if available_time_ms is not None else None
+    
     for sim_idx in range(n_sims):
         # Check time budget if provided (basic implementation)
         if start_time is not None and available_time_ms is not None:
@@ -1153,7 +1457,21 @@ def mcts_search(
                 # Time budget exhausted
                 break
         
-        run_simulation(root, root_state, model, effective_config)
+        run_simulation(root, root_state, model, effective_config, batch_evaluator)
+    
+    # Final batch evaluation to flush any remaining pending states
+    # (Most batching happens automatically in evaluate_state_with_model)
+    if batch_evaluator is not None:
+        # Check if there are pending states (thread-safe)
+        batch_evaluator.evaluate_batch()  # This is safe to call even if empty
+    
+    # Log batch evaluation statistics
+    stats = batch_evaluator.get_stats()
+    if stats['total'] > 0:
+        batched_pct = (stats['batched'] / stats['total']) * 100
+        cached_pct = (stats['cached'] / stats['total']) * 100
+        print(f"Batch inference stats: {stats['batched']} batched ({batched_pct:.1f}%), "
+              f"{stats['cached']} cached ({cached_pct:.1f}%), {stats['single']} single")
     
     # Move selection at root with policy-aware blending
     # Collect visit counts for root children
@@ -1178,7 +1496,8 @@ def mcts_search(
     # This ensures we have the original network policy (not affected by Dirichlet noise)
     from .encoding import legal_mask_4672
     device = torch.device(effective_config.device) if isinstance(effective_config.device, str) else effective_config.device
-    policy_logits, _ = evaluate_state_with_model(root_state, model, device)
+    # Pass batch_evaluator to reuse cached result (root was already evaluated during expansion)
+    policy_logits, _ = evaluate_state_with_model(root_state, model, device, batch_evaluator)
     
     # Get legal moves and build policy distribution p over the same move order
     legal_moves = list(root_state.generate_legal_moves())

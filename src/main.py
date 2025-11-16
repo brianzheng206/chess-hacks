@@ -30,7 +30,7 @@ import torch
 import pathlib
 REPO_ROOT = pathlib.Path(__file__).parent.parent
 # Use stockfish_949.pt from local repository
-MODEL_PATH = str(REPO_ROOT / "stockfish_949_distilling.pt")
+MODEL_PATH = str(REPO_ROOT / "stockfish_949.pt")
 # Opening book enabled
 OPENING_BOOK_PATH = str(REPO_ROOT / "opening_book.pkl") if (REPO_ROOT / "opening_book.pkl").exists() else None
 
@@ -973,9 +973,15 @@ def test_func(ctx: GameContext):
                 # Make even more aggressive: top > 0.10, MCTS < 0.08, multiplier > 2.0
                 # Make less aggressive: top > 0.20, MCTS < 0.04, multiplier > 4.0
                 if top_policy_prob > 0.12 and mcts_policy_prob < 0.06 and top_policy_prob > mcts_policy_prob * 2.5:
+                    # Calculate ratio safely (avoid division by zero)
+                    if mcts_policy_prob > 0:
+                        ratio = top_policy_prob / mcts_policy_prob
+                        ratio_str = f"{ratio:.1f}x higher"
+                    else:
+                        ratio_str = "infinitely higher (MCTS prob=0)"
                     print(f"Policy trust override: MCTS chose {mv.uci()} (prob={mcts_policy_prob:.4f}), "
                           f"but policy top move {policy_move.uci()} has prob={top_policy_prob:.4f} "
-                          f"({top_policy_prob/mcts_policy_prob:.1f}x higher). Using policy move.")
+                          f"({ratio_str}). Using policy move.")
                     mv = policy_move
                     decision_mode = "Policy trust override"
             
