@@ -1997,14 +1997,14 @@ def mcts_search(
     # (SearchTree provides one for cross-search caching)
     if batch_evaluator is None:
         device = torch.device(config.device) if isinstance(config.device, str) else config.device
-        # Optimized batch size heuristic: smaller batches for faster individual evaluations
-        # Smaller batches = lower latency per evaluation = faster moves
+        # Optimized batch size heuristic: very small batches for maximum speed
+        # Very small batches = lowest latency per evaluation = fastest moves
         if device.type == "cuda":
-            # Use smaller batches for GPU: faster individual evaluations
-            # Smaller batches = less waiting = faster moves
-            batch_size = min(64, max(8, n_sims // 3))  # Reduced from 128 and //2 for speed
+            # Use very small batches for GPU: fastest individual evaluations
+            # Very small batches = minimal waiting = fastest moves
+            batch_size = min(32, max(4, n_sims // 4))  # Reduced from 64 and //3 for maximum speed
         else:
-            batch_size = min(16, max(2, n_sims // 6))  # CPU: smaller batches for speed
+            batch_size = min(8, max(1, n_sims // 8))  # CPU: very small batches for maximum speed
         batch_evaluator = BatchEvaluator(model, device, batch_size=batch_size)
     
     # Run simulations with batch inference
@@ -2012,9 +2012,9 @@ def mcts_search(
     # We periodically flush batches during search for better GPU utilization
     start_time = time.time() if available_time_ms is not None else None
     
-    # Batch flush interval: evaluate batches more frequently for lower latency
-    # More frequent flushes = faster individual evaluations = faster moves
-    batch_flush_interval = max(1, batch_evaluator.batch_size // 2) if batch_evaluator else 8  # More frequent for speed
+    # Batch flush interval: evaluate batches very frequently for lowest latency
+    # Very frequent flushes = fastest individual evaluations = fastest moves
+    batch_flush_interval = max(1, batch_evaluator.batch_size // 3) if batch_evaluator else 4  # Very frequent for maximum speed
     
     for sim_idx in range(n_sims):
         # Check time budget if provided (basic implementation)

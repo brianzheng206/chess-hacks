@@ -132,8 +132,25 @@ async def get_move(request: Request):
     pgn = data["pgn"]
     timeleft = data["timeleft"]  # in milliseconds
 
-    chess_manager.set_context(pgn, timeleft)
-    print("pgn", pgn)
+    try:
+        chess_manager.set_context(pgn, timeleft)
+        print("pgn", pgn)
+    except Exception as e:
+        time_taken = (time.perf_counter() - start_time) * 1000
+        print(f"Error setting context: {e}")
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(
+            content={
+                "move": None,
+                "move_probs": None,
+                "time_taken": time_taken,
+                "error": f"Failed to set context: {str(e)}",
+                "logs": None,
+                "exception": str(e),
+            },
+            status_code=500,
+        )
 
     # Wait for main module to be loaded if it's still loading
     if main_module is None:
@@ -208,9 +225,57 @@ async def get_move(request: Request):
     move_probs = validated_move_probs
 
     # Translate move_probs to Dict[str, float]
-    move_probs_dict = {move.uci(): prob for move, prob in move_probs.items()}
+    try:
+        move_probs_dict = {move.uci(): prob for move, prob in move_probs.items()}
+    except Exception as e:
+        print(f"Error converting move_probs to dict: {e}")
+        # Fallback: create simple dict with just the move
+        move_probs_dict = {move.uci(): 1.0} if move else {}
 
-    return JSONResponse(content={"move": move.uci(), "error": None, "time_taken": time_taken, "move_probs": move_probs_dict, "logs": logs})
+    # Ensure we always return a valid response
+    if move is None:
+        return JSONResponse(
+            content={
+                "move": None,
+                "move_probs": {},
+                "error": "No move returned from bot",
+                "time_taken": time_taken,
+                "logs": logs,
+            },
+            status_code=500,
+        )
+
+    return JSONResponse(
+        content={
+            "move": move.uci(),
+            "error": None,
+            "time_taken": time_taken,
+            "move_probs": move_probs_dict,
+            "logs": logs
+        },
+        status_code=200  # Explicitly set 200 for success
+    )
+
+@app.post("/api/bot")
+async def api_bot(request: Request):
+    """Alias for /move endpoint - handles /api/bot requests."""
+    try:
+        return await get_move(request)
+    except Exception as e:
+        # Catch any unexpected errors and return a proper response
+        print(f"ERROR in /api/bot endpoint: {e}")
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(
+            content={
+                "move": None,
+                "move_probs": None,
+                "error": f"Internal server error: {str(e)}",
+                "logs": None,
+                "exception": str(e),
+            },
+            status_code=500,
+        )
 
 if __name__ == "__main__":
     port = int(os.getenv("SERVE_PORT", "5058"))

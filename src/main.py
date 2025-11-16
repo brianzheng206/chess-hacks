@@ -60,9 +60,9 @@ MODEL_PATH = str(REPO_ROOT / "stockfish_949_fp16.pt")
 # Opening book enabled
 OPENING_BOOK_PATH = str(REPO_ROOT / "opening_book.pkl") if (REPO_ROOT / "opening_book.pkl").exists() else None
 
-# Early termination constants for value-based decision skipping - OPTIMIZED FOR SPEED
-VALUE_EARLY_TERMINATION_THRESHOLD = 0.60  # abs(value) above this → skip PUCT (lowered from 0.70 for even more speed)
-VALUE_EARLY_TERMINATION_MIN_PLY = 0       # allow immediate termination (reduced from 1 for speed)
+# Early termination constants for value-based decision skipping - AGGRESSIVELY OPTIMIZED FOR SPEED
+VALUE_EARLY_TERMINATION_THRESHOLD = 0.45  # abs(value) above this → skip PUCT (lowered from 0.60 for maximum speed)
+VALUE_EARLY_TERMINATION_MIN_PLY = 0       # allow immediate termination
 
 # Policy confidence skip: if enabled, skip MCTS when policy is very confident
 # Currently disabled for accuracy - with ~50 sims budget, the extra search is worth it
@@ -90,11 +90,12 @@ HYBRID_PLY_THRESHOLD = 20  # Use pure policy when ply > 20
 OPENING_COMPARE_WITH_MCTS = False  # Enable MCTS comparison between model move and opening book (slower but more accurate)
 OPENING_QUICK_SEARCH = False  # Enable quick MCTS search to find better opening moves (slower but more accurate)
 
-# Time management flags - OPTIMIZED FOR SPEED
-INSTANT_MODE_THRESHOLD_MS = 30000  # Instant mode: skip everything, use fastest possible move (30 seconds - increased for even more speed)
-LOW_TIME_SKIP_MCTS_MS = 25000  # Skip MCTS entirely when time drops below this (25 seconds - increased for even more speed)
-CRITICAL_TIME_SKIP_MCTS_MS = 20000  # Force greedy policy when time is critically low (20 seconds - increased for even more speed)
-LOSING_BADLY_THRESHOLD = -0.7  # Force greedy policy when losing very badly (value < -0.7, more aggressive)
+# Time management flags - AGGRESSIVELY OPTIMIZED FOR SPEED
+ULTRA_FAST_MODE_THRESHOLD_MS = 10000  # Ultra-fast mode: < 10 seconds, use first legal move if no cache (maximum speed)
+INSTANT_MODE_THRESHOLD_MS = 20000  # Instant mode: skip everything, use fastest possible move (20 seconds - optimized for 10s target)
+LOW_TIME_SKIP_MCTS_MS = 15000  # Skip MCTS entirely when time drops below this (15 seconds - optimized for 10s target)
+CRITICAL_TIME_SKIP_MCTS_MS = 12000  # Force greedy policy when time is critically low (12 seconds - optimized for 10s target)
+LOSING_BADLY_THRESHOLD = -0.6  # Force greedy policy when losing very badly (value < -0.6, very aggressive)
 
 print("Loading chess engine model...")
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -188,8 +189,8 @@ if model is not None:
         engine = UciEngine(
             model,
             use_puct=True,
-            sims=30,  # Reduced from 40 for even more speed (will be adjusted by time management)
-            c_puct=0.3,  # Reduced from 0.4 to trust policy even more, faster convergence (speed optimized)
+            sims=20,  # Reduced from 30 for maximum speed (will be adjusted by time management)
+            c_puct=0.2,  # Reduced from 0.3 to trust policy heavily, very fast convergence (aggressive speed)
             device=device,
             opening_book_path=OPENING_BOOK_PATH,
             opening_max_ply=8,
@@ -391,33 +392,33 @@ def value_to_sims_scale(value: float) -> float:
     Args:
         value: Evaluation from the perspective of the side to move, in [-1, 1].
             - abs(value) near 0 → unclear position → scale ~1.0 (full search)
-            - abs(value) near 1 → clearly winning/losing → scale ~0.15 (very reduced search)
+            - abs(value) near 1 → clearly winning/losing → scale ~0.10 (very reduced search)
             - For losing positions (value < -0.3), use even more aggressive scaling
     
     Returns:
-        Scale factor in [0.15, 1.0] for adjusting simulation count (more aggressive for speed).
+        Scale factor in [0.10, 1.0] for adjusting simulation count (aggressively optimized for speed).
     """
     abs_value = abs(float(value))
     value_float = float(value)
     
-    # Less aggressive scaling for better accuracy - still reduce for clear positions but not as much
+    # Very aggressive scaling for maximum speed - reduce search significantly for clear positions
     if value_float < -0.3:  # Losing position
-        # For losing positions, still reduce but less aggressively
+        # For losing positions, reduce aggressively
         if abs_value >= 0.85:
-            scale = 0.25  # Less aggressive for clearly losing positions (was 0.10)
+            scale = 0.10  # Very aggressive for clearly losing positions
         elif abs_value >= 0.5:
-            scale = 0.40  # Less aggressive for moderately losing positions (was 0.20)
+            scale = 0.20  # Aggressive for moderately losing positions
         else:
-            scale = 0.55  # Less aggressive for slightly losing positions (was 0.35)
+            scale = 0.35  # Moderate for slightly losing positions
     elif abs_value >= 0.85:  # Very winning/losing (but winning)
-        scale = 0.30  # Less aggressive for clearly winning positions (was 0.15)
+        scale = 0.15  # Aggressive for clearly winning positions
     else:
-        # Linear mapping: abs_value 0.0 → scale 1.0, abs_value 0.85 → scale ~0.30
-        # Less aggressive than before for better accuracy
-        scale = 1.0 - 0.8 * abs_value
+        # Linear mapping: abs_value 0.0 → scale 1.0, abs_value 0.85 → scale ~0.15
+        # More aggressive than before for maximum speed
+        scale = 1.0 - 1.0 * abs_value
     
-    # Clamp to [0.25, 1.0] to ensure reasonable bounds (raised minimum from 0.15)
-    return max(0.25, min(1.0, scale))
+    # Clamp to [0.10, 1.0] to ensure reasonable bounds (lowered minimum from 0.25)
+    return max(0.10, min(1.0, scale))
 
 
 # Piece values for tactical evaluation
@@ -538,31 +539,43 @@ def test_func(ctx: GameContext):
         ctx.logProbabilities({})
         raise ValueError("No legal moves available (i probably lost didn't i)")
 
+    # Get time early to check for ultra-fast mode
+    movetime_ms_early = ctx.timeLeft if ctx.timeLeft and ctx.timeLeft > 0 else 0
+    
+    # OPTIMIZATION: Skip tactical checks in ultra-fast mode (< 10 seconds) for maximum speed
+    skip_tactical_for_time = movetime_ms_early > 0 and movetime_ms_early < ULTRA_FAST_MODE_THRESHOLD_MS
+    
     # 0. Immediate tactical wins: never miss mate-in-one
     # This is the single highest-impact, lowest-cost accuracy boost
     # Cost: O(#legal_moves) with one push/pop each – very cheap
     # Effect: engine will never miss a mate in one, regardless of what the net/MCTS think
-    board = ctx.board
-    for mv in legal_moves:
-        board.push(mv)
-        if board.is_checkmate():
+    # OPTIMIZATION: Skip in ultra-fast mode for maximum speed
+    if not skip_tactical_for_time:
+        board = ctx.board
+        for mv in legal_moves:
+            board.push(mv)
+            if board.is_checkmate():
+                board.pop()
+                if VERBOSE:
+                    print(f"Forced mate in 1 found: {mv.uci()}")
+                ctx.logProbabilities({mv: 1.0})
+                return mv
             board.pop()
-            if VERBOSE:
-                print(f"Forced mate in 1 found: {mv.uci()}")
-            ctx.logProbabilities({mv: 1.0})
-            return mv
-        board.pop()
 
     # 1. Simple tactical scan: find obvious winning captures (all phases)
     # This catches "missed free rook/queen" type positions cheaply
     # Cost: O(#legal_moves) - very cheap
     # Effect: engine will never miss obvious winning captures
-    tactical_mv = find_obvious_tactic(ctx.board, legal_moves)
-    if tactical_mv is not None:
-        if VERBOSE:
-            print(f"Taking obvious winning capture: {tactical_mv.uci()}")
-        ctx.logProbabilities({tactical_mv: 1.0})
-        return tactical_mv
+    # OPTIMIZATION: Skip tactical scan in early post-opening and ultra-fast mode for maximum speed
+    if not skip_tactical_for_time:
+        current_ply_for_tactical = len(ctx.board.move_stack)
+        if not (current_ply_for_tactical >= 8 and current_ply_for_tactical < 18):
+            tactical_mv = find_obvious_tactic(ctx.board, legal_moves)
+            if tactical_mv is not None:
+                if VERBOSE:
+                    print(f"Taking obvious winning capture: {tactical_mv.uci()}")
+                ctx.logProbabilities({tactical_mv: 1.0})
+                return tactical_mv
 
     # Check if engine is initialized
     if engine is None or model is None:
@@ -573,11 +586,62 @@ def test_func(ctx: GameContext):
         ctx.logProbabilities(move_probs)
         return move
     
-    # INSTANT MODE: When time is critically low (< 10 seconds), make moves instantly
+    # NOTE: ctx.timeLeft comes from the platform (ChessHacks) via GameContext, not our own timer
+    movetime_ms = movetime_ms_early  # Use the early check we did above
+    
+    # ULTRA-FAST MODE: When time is < 10 seconds, use absolute fastest path
+    # Skip ALL expensive operations: NN eval, MCTS, opening book, tactical checks
+    # Just use cached eval if available, otherwise use first legal move
+    if movetime_ms > 0 and movetime_ms < ULTRA_FAST_MODE_THRESHOLD_MS:
+        if VERBOSE:
+            print(f"ULTRA-FAST MODE: timeLeft={movetime_ms:.0f}ms < {ULTRA_FAST_MODE_THRESHOLD_MS}ms - using fastest possible move")
+        
+        # Try cached evaluation first (fastest possible)
+        cached_result = _cached_nn_eval(ctx.board)
+        if cached_result is not None:
+            # Cache hit - use it instantly
+            root_policy_logits, root_value = cached_result
+            from .chess_policy.encoding import legal_mask_4672
+            from .chess_policy.infer import mask_logits, probs_from_logits
+            from .chess_policy.move_index import index_to_move, POLICY_SIZE
+            
+            logits = root_policy_logits.to(device)
+            legal = torch.from_numpy(legal_mask_4672(ctx.board)).to(logits.device)
+            masked = mask_logits(logits, legal)
+            probs = probs_from_logits(masked, temperature=0.0)  # Deterministic
+            
+            idx = int(torch.argmax(probs).item())
+            move = index_to_move(ctx.board, idx) if 0 <= idx < POLICY_SIZE else None
+            
+            if move is None or move not in legal_moves:
+                # Fallback: try sorted moves (but limit iterations for speed)
+                order = torch.argsort(probs, descending=True).tolist()[:10]  # Only check top 10
+                for i in order:
+                    if 0 <= i < POLICY_SIZE:
+                        mv_try = index_to_move(ctx.board, int(i))
+                        if mv_try is not None and mv_try in legal_moves:
+                            move = mv_try
+                            break
+                if move is None or move not in legal_moves:
+                    move = legal_moves[0]
+            
+            move_probs = {move: 1.0}
+            ctx.logProbabilities(move_probs)
+            if VERBOSE:
+                print(f"Ultra-fast move (cached): {move.uci()}")
+            return move
+        
+        # No cache - use first legal move (fastest possible, no NN eval)
+        move = legal_moves[0]
+        move_probs = {move: 1.0}
+        ctx.logProbabilities(move_probs)
+        if VERBOSE:
+            print(f"Ultra-fast move (first legal, no cache): {move.uci()}")
+        return move
+    
+    # INSTANT MODE: When time is low (< 20 seconds), make moves instantly
     # Skip all expensive operations: MCTS, opening book comparisons, etc.
     # Just use cached NN eval if available, or do a quick NN eval, then pick top move
-    # NOTE: ctx.timeLeft comes from the platform (ChessHacks) via GameContext, not our own timer
-    movetime_ms = ctx.timeLeft if ctx.timeLeft and ctx.timeLeft > 0 else 0
     if movetime_ms > 0 and movetime_ms < INSTANT_MODE_THRESHOLD_MS:
         if VERBOSE:
             print(f"INSTANT MODE: timeLeft={movetime_ms:.0f}ms < {INSTANT_MODE_THRESHOLD_MS}ms - making instant move")
@@ -718,7 +782,10 @@ def test_func(ctx: GameContext):
     
     # OPTIMIZATION: For very early opening (first 4 moves), skip NN evaluation
     # and go straight to opening book for maximum speed
-    skip_nn_eval = current_ply < 4
+    # Also skip NN eval for early post-opening (ply 8-18) to use pure policy for maximum speed
+    # OPTIMIZATION: Skip expensive tactical checks in early post-opening for speed
+    skip_nn_eval = current_ply < 4 or (current_ply >= 8 and current_ply < 18)
+    skip_tactical_checks = current_ply >= 8 and current_ply < 18  # Skip tactical scan in early post-opening
     
     # -------------------------
     # STEP 1: POLICY EVALUATION (skip for very early opening)
@@ -731,7 +798,8 @@ def test_func(ctx: GameContext):
     sorted_moves = []   # NEW: always defined as list
     move_probs = {}     # NEW: initialize here for logging
 
-    # Only run NN evaluation if not in very early opening
+    # Only run NN evaluation if not in very early opening or early post-opening
+    # Early post-opening (ply 8-12): use pure policy for speed, skip MCTS
     if not skip_nn_eval:
         try:
             # Determine temperature based on game phase
@@ -1102,103 +1170,110 @@ def test_func(ctx: GameContext):
         moves_remaining_estimate = max(8, int(movetime_ms / 1200))  # Slightly more conservative
         time_per_move_ms = movetime_ms / max(moves_remaining_estimate, 1)
         
-        # Adaptive simulation rate - OPTIMIZED FOR SPEED (reduced rates)
+        # Adaptive simulation rate - AGGRESSIVELY OPTIMIZED FOR SPEED (very reduced rates)
         if time_per_move_ms > 2500:  # >2.5 seconds per move: can search more
-            sims_per_sec = 80  # Reduced from 100 for even more speed
+            sims_per_sec = 60  # Reduced from 80 for maximum speed
         elif time_per_move_ms > 1200:  # 1.2-2.5 seconds: moderate search
-            sims_per_sec = 65  # Reduced from 80 for even more speed
+            sims_per_sec = 50  # Reduced from 65 for maximum speed
         elif time_per_move_ms > 600:  # 0.6-1.2 seconds: fast search
-            sims_per_sec = 50  # Reduced from 65 for even more speed
+            sims_per_sec = 40  # Reduced from 50 for maximum speed
         elif time_per_move_ms > 300:  # 0.3-0.6 seconds: very fast
-            sims_per_sec = 40  # Reduced from 50 for even more speed
+            sims_per_sec = 30  # Reduced from 40 for maximum speed
         else:  # <0.3 seconds: critical, minimal search
-            sims_per_sec = 28  # Reduced from 35 for even more speed
+            sims_per_sec = 20  # Reduced from 28 for maximum speed
         
-        # Use more aggressive time budget for speed - OPTIMIZED FOR SPEED
-        # Use only 40% of estimated time per move to ensure very fast moves
-        time_budget_ms = time_per_move_ms * 0.40  # Reduced from 0.50 for even more speed
-        estimated_sims = max(6, int(time_budget_ms * sims_per_sec / 1000.0))  # Reduced min from 10 to 6
+        # Use very aggressive time budget for speed - AGGRESSIVELY OPTIMIZED FOR SPEED
+        # Use only 30% of estimated time per move to ensure maximum speed
+        time_budget_ms = time_per_move_ms * 0.30  # Reduced from 0.40 for maximum speed
+        estimated_sims = max(3, int(time_budget_ms * sims_per_sec / 1000.0))  # Reduced min from 6 to 3
         
-        # Cap simulations based on time remaining - FURTHER OPTIMIZED FOR SPEED
+        # Cap simulations based on time remaining - AGGRESSIVELY OPTIMIZED FOR SPEED
         if movetime_ms > 40000:  # >40 seconds left (early game)
-            max_sims = 28  # Reduced from 35 for even more speed
+            max_sims = 20  # Reduced from 28 for maximum speed
         elif movetime_ms > 25000:  # 25-40 seconds
-            max_sims = 22  # Reduced from 28 for even more speed
+            max_sims = 16  # Reduced from 22 for maximum speed
         elif movetime_ms > 15000:  # 15-25 seconds
-            max_sims = 18  # Reduced from 22 for even more speed
+            max_sims = 12  # Reduced from 18 for maximum speed
         elif movetime_ms > 8000:  # 8-15 seconds
-            max_sims = 14  # Reduced from 18 for even more speed
+            max_sims = 10  # Reduced from 14 for maximum speed
         elif movetime_ms > 4000:  # 4-8 seconds
-            max_sims = 10  # Reduced from 14 for even more speed
+            max_sims = 7  # Reduced from 10 for maximum speed
         elif movetime_ms > 2000:  # 2-4 seconds
-            max_sims = 8  # Reduced from 10 for even more speed
+            max_sims = 5  # Reduced from 8 for maximum speed
         else:  # <2 seconds: critical time
-            max_sims = 4  # Reduced from 6 for even more speed
+            max_sims = 3  # Reduced from 4 for maximum speed
         
         sims = min(estimated_sims, max_sims)
         
-        # Additional time pressure handling - FURTHER OPTIMIZED FOR SPEED
+        # Additional time pressure handling - AGGRESSIVELY OPTIMIZED FOR SPEED
         if movetime_ms < 15000:  # Less than 15 seconds
-            sims = min(sims, 20)  # Reduced from 25 for even more speed
+            sims = min(sims, 15)  # Reduced from 20 for maximum speed
         if movetime_ms < 8000:  # Less than 8 seconds
-            sims = min(sims, 14)  # Reduced from 18 for even more speed
+            sims = min(sims, 10)  # Reduced from 14 for maximum speed
         if movetime_ms < 4000:  # Less than 4 seconds
-            sims = min(sims, 10)  # Reduced from 12 for even more speed
+            sims = min(sims, 7)  # Reduced from 10 for maximum speed
         if movetime_ms < 2000:  # Less than 2 seconds
-            sims = min(sims, 6)  # Reduced from 8 for even more speed
+            sims = min(sims, 4)  # Reduced from 6 for maximum speed
         
-        # Absolute global cap - FURTHER OPTIMIZED FOR SPEED
-        sims = min(sims, 25)  # Reduced from 32 for even more speed
+        # Absolute global cap - AGGRESSIVELY OPTIMIZED FOR SPEED
+        sims = min(sims, 18)  # Reduced from 25 for maximum speed
     else:
-        # No time info available - use conservative defaults - OPTIMIZED FOR SPEED
-        sims = min(sims, 25)  # Reduced from 35 for even more speed
+        # No time info available - use conservative defaults - AGGRESSIVELY OPTIMIZED FOR SPEED
+        sims = min(sims, 18)  # Reduced from 25 for maximum speed
     
-    # Phase-aware adjustments - OPTIMIZED FOR SPEED
-    # Strategy: Trust policy more, reduce search in all phases for faster moves
-    if game_phase > 0.7:  # Opening
-        sims = min(sims, 22)  # Reduced from 30 for even more speed
+    # Phase-aware adjustments - AGGRESSIVELY OPTIMIZED FOR SPEED
+    # Strategy: Trust policy heavily, minimize search in all phases for maximum speed
+    # OPTIMIZATION: Early post-opening (ply 8-20) gets even more aggressive treatment
+    early_post_opening = current_ply >= 8 and current_ply < 20
+    if early_post_opening:
+        # Right after opening book ends, use minimal search or skip entirely
+        sims = min(sims, 5)  # Very minimal search for early post-opening (reduced from 8)
         if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
-            engine.mcts_config.c_puct = 0.25  # Reduced from 0.35 - trust policy even more for speed
+            engine.mcts_config.c_puct = 0.10  # Very low - trust policy extremely heavily
+    elif game_phase > 0.7:  # Opening
+        sims = min(sims, 15)  # Reduced from 22 for maximum speed
+        if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
+            engine.mcts_config.c_puct = 0.15  # Reduced from 0.25 - trust policy very heavily for speed
     elif game_phase < 0.3:  # Endgame
         # In endgame, be very efficient - trust policy heavily
         if movetime_ms > 0:
             if movetime_ms < 8000:  # Less than 8 seconds: time pressure
-                sims = min(sims, 18)  # Reduced from 25 for even more speed
+                sims = min(sims, 12)  # Reduced from 18 for maximum speed
                 if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
-                    engine.mcts_config.c_puct = 0.25  # Trust policy very heavily for speed
+                    engine.mcts_config.c_puct = 0.15  # Trust policy very heavily for speed
             elif movetime_ms < 15000:  # 8-15 seconds: moderate time
-                sims = min(sims, 25)  # Reduced from 35 for even more speed
+                sims = min(sims, 18)  # Reduced from 25 for maximum speed
                 if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
-                    engine.mcts_config.c_puct = 0.25  # Trust policy more for speed
+                    engine.mcts_config.c_puct = 0.15  # Trust policy more for speed
             else:  # >15 seconds: can search more
-                sims = min(sims, 30)  # Reduced from 40 for even more speed
+                sims = min(sims, 20)  # Reduced from 30 for maximum speed
                 if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
-                    engine.mcts_config.c_puct = 0.25  # Trust policy more for speed
+                    engine.mcts_config.c_puct = 0.15  # Trust policy more for speed
         else:
             # No time info - use safe defaults for endgame
-            sims = min(sims, 25)  # Reduced from 35 for even more speed
+            sims = min(sims, 18)  # Reduced from 25 for maximum speed
             if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
-                engine.mcts_config.c_puct = 0.25
+                engine.mcts_config.c_puct = 0.15
     else:  # Midgame - prioritize speed (AGGRESSIVE FOR PLY 10-14)
-        # Midgame: be very fast, trust policy more - FURTHER REDUCED FOR SPEED
+        # Midgame: be very fast, trust policy more - AGGRESSIVELY REDUCED FOR SPEED
         if movetime_ms > 0:
             if movetime_ms > 30000:  # Plenty of time: still prioritize speed
-                sims = min(sims, 28)  # Reduced from 35 for even more speed (middlegame optimization)
+                sims = min(sims, 20)  # Reduced from 28 for maximum speed (middlegame optimization)
                 if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
-                    engine.mcts_config.c_puct = 0.25  # Reduced from 0.30 - trust policy even more
+                    engine.mcts_config.c_puct = 0.15  # Reduced from 0.25 - trust policy very heavily
             elif movetime_ms > 15000:  # Moderate time: be fast
-                sims = min(sims, 22)  # Reduced from 28 for even more speed (middlegame optimization)
+                sims = min(sims, 15)  # Reduced from 22 for maximum speed (middlegame optimization)
                 if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
-                    engine.mcts_config.c_puct = 0.25  # Reduced from 0.30 - trust policy even more
+                    engine.mcts_config.c_puct = 0.15  # Reduced from 0.25 - trust policy very heavily
             else:  # Time pressure: minimal search
-                sims = min(sims, 18)  # Reduced from 22 for even more speed (middlegame optimization)
+                sims = min(sims, 12)  # Reduced from 18 for maximum speed (middlegame optimization)
                 if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
-                    engine.mcts_config.c_puct = 0.25  # Reduced from 0.30 - trust policy heavily
+                    engine.mcts_config.c_puct = 0.15  # Reduced from 0.25 - trust policy very heavily
         else:
             # No time info - use safe defaults for midgame
-            sims = min(sims, 22)  # Reduced from 28 for even more speed (middlegame optimization)
+            sims = min(sims, 15)  # Reduced from 22 for maximum speed (middlegame optimization)
             if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
-                engine.mcts_config.c_puct = 0.25  # Reduced from 0.30
+                engine.mcts_config.c_puct = 0.15  # Reduced from 0.25
     
     # ------------------------------
     # VALUE-AWARE SIMS SCALING
@@ -1213,23 +1288,23 @@ def test_func(ctx: GameContext):
         value_float = float(value)
         abs_value = abs(value_float)
         
-        # Reduced minimums for speed - OPTIMIZED FOR SPEED
+        # Reduced minimums for speed - AGGRESSIVELY OPTIMIZED FOR SPEED
         if abs_value >= 0.85:
-            min_sims = 3  # Very winning/losing - minimal search for speed
+            min_sims = 1  # Very winning/losing - minimal search for maximum speed
         elif value_float < -0.3:  # Losing position
-            min_sims = 3  # Losing - minimal search for speed
+            min_sims = 1  # Losing - minimal search for maximum speed
         elif abs_value >= 0.5:
-            min_sims = 6  # Moderately winning/losing - reduced for speed
+            min_sims = 3  # Moderately winning/losing - very reduced for maximum speed
         else:
-            min_sims = 10  # Unclear positions - reduced for speed
+            min_sims = 6  # Unclear positions - reduced for maximum speed
         
         sims = max(min_sims, int(sims * scale))
         if VERBOSE:
             print(f"Value-aware sims scaling: value={value_float:+.3f}, scale={scale:.2f}, sims {sims_before} → {sims}")
     elif value is not None and tactical_heavy:
-        # Reduced bump for tactical chaos - OPTIMIZED FOR SPEED
+        # Reduced bump for tactical chaos - AGGRESSIVELY OPTIMIZED FOR SPEED
         sims_before = sims
-        sims = max(sims, 12)  # Reduced from 15 for even more speed
+        sims = max(sims, 8)  # Reduced from 12 for maximum speed
         if VERBOSE and sims > sims_before:
             print(f"Tactical position: increased sims from {sims_before} to {sims} (tactical_heavy=True)")
     
@@ -1465,6 +1540,10 @@ def test_func(ctx: GameContext):
             return move
         
         # Use model/MCTS for non-opening positions
+        # OPTIMIZATION: Right after opening (ply 8-20), use pure policy for maximum speed
+        # This avoids expensive MCTS right after opening book ends
+        early_post_opening = current_ply >= 8 and current_ply < 20
+        
         # NEW: Force greedy policy in critical situations (critical time or losing badly)
         # BUT: never skip search in tactical positions where tactics matter
         # Check for critical time (very low on clock)
@@ -1507,27 +1586,39 @@ def test_func(ctx: GameContext):
                 if VERBOSE:
                     print(f"Warning: policy_move invalid, using first legal move: {move.uci()}")
             else:
-                # Only call choose_move if we skipped NN eval earlier (very early opening)
-                try:
-                    mv, _, _ = choose_move(ctx.board, model, device=device, temperature=0.8, sample=False)
-                    move = mv
+                # Only call choose_move if we skipped NN eval earlier (very early opening or early post-opening)
+                # OPTIMIZATION: For early post-opening, use a very fast heuristic instead of full NN eval
+                if current_ply >= 8 and current_ply < 18:
+                    # Early post-opening: use simple heuristic (first reasonable move) for maximum speed
+                    # Skip expensive NN forward pass
+                    move = legal_move_list[0]  # Use first legal move for maximum speed
                     if VERBOSE:
-                        print(f"Using greedy policy move: {move.uci()}")
-                except Exception as e:
-                    # Fallback if choose_move fails
-                    print(f"info string Error in greedy selection: {e}", file=sys.stderr)
-                    # Fallback to first legal move
-                    move = legal_move_list[0]
-                    print(f"Fallback to first legal move: {move.uci()}")
+                        print(f"Using fast heuristic move (early post-opening): {move.uci()}")
+                else:
+                    try:
+                        mv, _, _ = choose_move(ctx.board, model, device=device, temperature=0.8, sample=False)
+                        move = mv
+                        if VERBOSE:
+                            print(f"Using greedy policy move: {move.uci()}")
+                    except Exception as e:
+                        # Fallback if choose_move fails
+                        print(f"info string Error in greedy selection: {e}", file=sys.stderr)
+                        # Fallback to first legal move
+                        move = legal_move_list[0]
+                        print(f"Fallback to first legal move: {move.uci()}")
         # NEW: Skip PUCT if early termination is triggered (extreme value magnitude)
         # NEW: Skip MCTS if policy is very confident (policy_confidence_skip)
         # NEW: Skip MCTS if low on time (use greedy policy for speed)
+        # NEW: Skip MCTS in early post-opening (ply 8-15) for maximum speed
         # BUT: never skip in tactical positions where tactics matter
         elif not early_termination and not policy_confidence_skip:
             skip_mcts_for_time = movetime_ms > 0 and movetime_ms < LOW_TIME_SKIP_MCTS_MS and not tactical_heavy
+            skip_mcts_early_post_opening = early_post_opening and not tactical_heavy
             if movetime_ms > 0 and movetime_ms < LOW_TIME_SKIP_MCTS_MS and tactical_heavy and VERBOSE:
                 print("Skipping time-based MCTS skip due to tactical complexity (checks/captures/promotions)")
-            if not skip_mcts_for_time and engine.use_puct and hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
+            if early_post_opening and tactical_heavy and VERBOSE:
+                print("Skipping early post-opening MCTS skip due to tactical complexity (checks/captures/promotions)")
+            if not skip_mcts_for_time and not skip_mcts_early_post_opening and engine.use_puct and hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
                 decision_mode = "MCTS search"
                 if VERBOSE:
                     print(f"Decision mode: {decision_mode} (ply {current_ply}, phase={game_phase:.2f})")
@@ -1722,10 +1813,15 @@ def test_func(ctx: GameContext):
                     move = legal_move_list[0]
                     if VERBOSE:
                         print(f"Fallback to first legal move: {move.uci()}")
-            elif skip_mcts_for_time:
-                decision_mode = "Greedy policy (low time)"
-                if VERBOSE:
-                    print(f"Decision mode: {decision_mode} (movetime_ms={movetime_ms}, ply {current_ply})")
+            elif skip_mcts_for_time or skip_mcts_early_post_opening:
+                if skip_mcts_early_post_opening:
+                    decision_mode = "Greedy policy (early post-opening)"
+                    if VERBOSE:
+                        print(f"Decision mode: {decision_mode} (ply {current_ply}, skipping MCTS for speed)")
+                else:
+                    decision_mode = "Greedy policy (low time)"
+                    if VERBOSE:
+                        print(f"Decision mode: {decision_mode} (movetime_ms={movetime_ms}, ply {current_ply})")
                 # OPTIMIZATION: Always prefer policy_move if available (avoids redundant choose_move call)
                 if policy_move is not None and policy_move in legal_moves:
                     move = policy_move
@@ -1738,13 +1834,19 @@ def test_func(ctx: GameContext):
                         print(f"Warning: policy_move invalid, using first legal move: {move.uci()}")
                 else:
                     # Only call choose_move if we skipped NN eval earlier
-                    try:
-                        mv, _, _ = choose_move(ctx.board, model, device=device, temperature=0.8, sample=False)
-                        move = mv
-                    except Exception as e:
-                        # Fallback if choose_move fails
-                        print(f"info string Error in greedy selection: {e}", file=sys.stderr)
-                        move = next(iter(ctx.board.legal_moves), None)
+                    # OPTIMIZATION: For early post-opening, use fast heuristic instead
+                    if current_ply >= 8 and current_ply < 18:
+                        move = legal_move_list[0]  # Use first legal move for maximum speed
+                        if VERBOSE:
+                            print(f"Using fast heuristic move (early post-opening, low time): {move.uci()}")
+                    else:
+                        try:
+                            mv, _, _ = choose_move(ctx.board, model, device=device, temperature=0.8, sample=False)
+                            move = mv
+                        except Exception as e:
+                            # Fallback if choose_move fails
+                            print(f"info string Error in greedy selection: {e}", file=sys.stderr)
+                            move = next(iter(ctx.board.legal_moves), None)
             else:
                 decision_mode = "Greedy policy"
                 if VERBOSE:
@@ -1761,13 +1863,19 @@ def test_func(ctx: GameContext):
                         print(f"Warning: policy_move invalid, using first legal move: {move.uci()}")
                 else:
                     # Only call choose_move if we skipped NN eval earlier
-                    try:
-                        mv, _, _ = choose_move(ctx.board, model, device=device, temperature=0.8, sample=False)
-                        move = mv
-                    except Exception as e:
-                        # Fallback if choose_move fails
-                        print(f"info string Error in greedy selection: {e}", file=sys.stderr)
-                        move = next(iter(ctx.board.legal_moves), None)
+                    # OPTIMIZATION: For early post-opening, use fast heuristic instead
+                    if current_ply >= 8 and current_ply < 18:
+                        move = legal_move_list[0]  # Use first legal move for maximum speed
+                        if VERBOSE:
+                            print(f"Using fast heuristic move (early post-opening, greedy): {move.uci()}")
+                    else:
+                        try:
+                            mv, _, _ = choose_move(ctx.board, model, device=device, temperature=0.8, sample=False)
+                            move = mv
+                        except Exception as e:
+                            # Fallback if choose_move fails
+                            print(f"info string Error in greedy selection: {e}", file=sys.stderr)
+                            move = next(iter(ctx.board.legal_moves), None)
         
         # Fallback if selected move is invalid
         if move is None or move not in legal_moves:
