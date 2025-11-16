@@ -5,6 +5,7 @@ import os
 import io
 import contextlib
 import time
+import threading
 from functools import lru_cache
 import numpy as np
 import chess
@@ -96,112 +97,68 @@ LOW_TIME_SKIP_MCTS_MS = 15000  # Skip MCTS entirely when time drops below this (
 CRITICAL_TIME_SKIP_MCTS_MS = 10000  # Force greedy policy when time is critically low (10 seconds - increased for speed)
 LOSING_BADLY_THRESHOLD = -0.8  # Force greedy policy when losing very badly (value < -0.9)
 
-print("Loading chess engine model...")
+# LAZY MODEL LOADING - Model will be loaded on first request to speed up deployment
+# This allows the server to start immediately without waiting for model loading
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
+print("Model will be loaded lazily on first request to speed up deployment")
 
-# Load model checkpoint - use load_checkpoint for robust loading with defaults
-# This handles missing metadata, different architectures, and backward compatibility
-# IMPORTANT: Model loading errors should not prevent server startup
-# The server needs to be able to start even if model loading fails initially
+# Model will be loaded on first use
 model = None
-try:
-    if not os.path.exists(MODEL_PATH):
-        print(f"WARNING: Model file not found at {MODEL_PATH}")
-        print("Server will start but model-dependent features will not work")
-    else:
-        model = load_checkpoint(MODEL_PATH, map_location=device)
-        model.to(device)
-        model.eval()
-        
-        print("Model loaded successfully")
-        # Verify model loaded correctly by checking a test inference
-        import chess
-        from .chess_policy.infer import choose_move
-        from .chess_policy.move_index import move_to_index
-        test_board = chess.Board()
-        test_board.push(chess.Move.from_uci('e2e4'))
-        test_move, test_probs, test_value = choose_move(test_board, model, device=device, temperature=0.7, sample=False)
-        test_legal = list(test_board.generate_legal_moves())
-        test_probs_dict = {}
-        # Check ALL legal moves, not just first 5
-        for mv in test_legal:
-            try:
-                idx = move_to_index(test_board, mv)
-                if idx is not None and idx < len(test_probs):
-                    test_probs_dict[mv] = float(test_probs[idx].item())
-            except:
-                pass
-        if test_probs_dict:
-            test_total = sum(test_probs_dict.values())
-            test_max = max(test_probs_dict.values()) if test_probs_dict else 0
-            # Normalize to see actual probabilities
-            if test_total > 0:
-                test_probs_normalized = {mv: p / test_total for mv, p in test_probs_dict.items()}
-                test_max_norm = max(test_probs_normalized.values())
-                sorted_test = sorted(test_probs_normalized.items(), key=lambda x: x[1], reverse=True)
-                print(f"Model verification: max prob={test_max_norm:.4f} ({test_max_norm*100:.1f}%), sum={test_total:.4f}")
-                print(f"  Top 3 moves: {[(mv.uci(), f'{p*100:.1f}%') for mv, p in sorted_test[:3]]}")
-            if test_max < 0.1 or test_total < 0.5:
-                print("WARNING: Model probabilities are very low - model may not have loaded correctly!")
-                print(f"  This suggests the model weights may not have loaded properly.")
-            else:
-                print(f"Model verification passed: top move has {test_max*100:.1f}% probability")
-except Exception as e:
-    print(f"ERROR: Failed to load model: {e}")
-    import traceback
-    traceback.print_exc()
-    print("WARNING: Server will start but model-dependent features will not work")
-    print("This may be expected in deployment environments - model will be loaded on first request")
-    # Don't raise - allow server to start even if model loading fails
-    model = None
+_model_loading_lock = threading.Lock()
+_model_loaded = False
 
-# Performance optimizations: set model to eval mode and disable gradients
-if model is not None:
-    model.eval()
-    # Compile model for faster inference (PyTorch 2.0+)
-    try:
-        if hasattr(torch, 'compile'):
-            print("Compiling model with torch.compile() for faster inference...")
-            model = torch.compile(model, mode='reduce-overhead')
-            print("Model compiled successfully")
-    except Exception as e:
-        print(f"Warning: torch.compile() failed (may not be available): {e}")
-        print("Continuing without compilation - this is fine for older PyTorch versions")
+def _load_model_lazy():
+    """Load model on first request - lazy loading for fast deployment."""
+    global model, _model_loaded
+    if _model_loaded:
+        return model
+    
+    with _model_loading_lock:
+        # Double-check after acquiring lock
+        if _model_loaded:
+            return model
+        
+        print("Loading chess engine model (lazy load on first request)...")
+        try:
+            if not os.path.exists(MODEL_PATH):
+                print(f"WARNING: Model file not found at {MODEL_PATH}")
+                print("Server will start but model-dependent features will not work")
+                model = None
+            else:
+                model = load_checkpoint(MODEL_PATH, map_location=device)
+                model.to(device)
+                model.eval()
+                print("Model loaded successfully")
+                
+                # Skip test inference to speed up loading - model will be verified on first real move
+                # Performance optimizations: set model to eval mode and disable gradients
+                torch.set_grad_enabled(False)
+                
+                # Skip torch.compile() during deployment - it takes too long
+                # Can be enabled later if needed, but slows down deployment significantly
+                # if hasattr(torch, 'compile'):
+                #     print("Compiling model with torch.compile()...")
+                #     model = torch.compile(model, mode='reduce-overhead')
+                
+        except Exception as e:
+            print(f"ERROR: Failed to load model: {e}")
+            import traceback
+            traceback.print_exc()
+            print("WARNING: Model loading failed - will retry on next request")
+            model = None
+        
+        _model_loaded = True
+        return model
+
 torch.set_grad_enabled(False)
 
 # Note: Warm-up is skipped to allow server to start quickly
 # The first move will naturally warm up the model, and the performance impact is minimal
 
-# Create UCI engine with PUCT search (only if model loaded successfully)
-# Optimized for 1-minute games: fast, efficient, trusts policy more
-# TUNING GUIDE: See MCTS_TUNING_GUIDE.md for detailed parameter tuning instructions
-# Key parameters:
-#   - sims: Number of MCTS simulations (higher = stronger but slower, default: 150 for 1-min)
-#   - c_puct: Exploration constant (lower = trust policy more, default: 0.6 for 1-min)
-#     * 0.5-0.6: Very conservative, trusts policy heavily (good for fast games)
-#     * 0.7-0.8: Balanced
-#     * 1.0-1.2: More exploration, may find hidden tactics but also blunders
+# UCI engine will be created lazily when model is loaded (on first request)
+# This allows server to start immediately without waiting for model/engine initialization
 engine = None
-if model is not None:
-    try:
-        engine = UciEngine(
-            model,
-            use_puct=True,
-            sims=40,  # Reduced from 60 for speed (will be adjusted by time management)
-            c_puct=0.4,  # Reduced from 0.5 to trust policy more, faster convergence (speed optimized)
-            device=device,
-            opening_book_path=OPENING_BOOK_PATH,
-            opening_max_ply=8,
-        )
-        print("Chess engine initialized")
-    except Exception as e:
-        print(f"ERROR: Failed to initialize UCI engine: {e}")
-        import traceback
-        traceback.print_exc()
-        engine = None
-else:
-    print("WARNING: Chess engine not initialized - model not loaded")
 
 # Global cache for neural network evaluations
 # This avoids re-evaluating the same position multiple times (transpositions, repetitions)
@@ -564,6 +521,29 @@ def test_func(ctx: GameContext):
         ctx.logProbabilities({tactical_mv: 1.0})
         return tactical_mv
 
+    # Lazy load model on first request if not already loaded
+    global model, engine
+    if model is None:
+        model = _load_model_lazy()
+        # Initialize engine if model was just loaded
+        if model is not None and engine is None:
+            try:
+                engine = UciEngine(
+                    model,
+                    use_puct=True,
+                    sims=40,  # Reduced from 60 for speed (will be adjusted by time management)
+                    c_puct=0.4,  # Reduced from 0.5 to trust policy more, faster convergence (speed optimized)
+                    device=device,
+                    opening_book_path=OPENING_BOOK_PATH,
+                    opening_max_ply=8,
+                )
+                print("Chess engine initialized (lazy load)")
+            except Exception as e:
+                print(f"ERROR: Failed to initialize UCI engine: {e}")
+                import traceback
+                traceback.print_exc()
+                engine = None
+    
     # Check if engine is initialized
     if engine is None or model is None:
         print("ERROR: Engine or model not initialized - cannot make move")
