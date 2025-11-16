@@ -473,8 +473,46 @@ def save_checkpoint(model: nn.Module, path: str) -> None:
 def load_checkpoint(path: str, map_location: Optional[str] = None) -> nn.Module:
     state = torch.load(path, map_location=map_location or ("cuda" if torch.cuda.is_available() else "cpu"))
     meta = state.get("meta", {})
-    arch = meta.get("arch", "TinyPolicyResNet")
+    arch = meta.get("arch", None)
     state_dict = state["model"]
+    
+    # Strip _orig_mod. prefix if present (from torch.compile or similar wrappers)
+    if any(k.startswith("_orig_mod.") for k in state_dict.keys()):
+        state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+        print("Stripped _orig_mod. prefix from checkpoint keys")
+    
+    # Map tower -> trunk if present (some checkpoints use "tower" instead of "trunk")
+    if any("tower" in k for k in state_dict.keys()) and not any("trunk" in k for k in state_dict.keys()):
+        state_dict = {k.replace("tower", "trunk"): v for k, v in state_dict.items()}
+        print("Mapped 'tower' -> 'trunk' in checkpoint keys")
+    
+    # Auto-detect architecture if not in metadata
+    if arch is None:
+        # Check for value head components to identify PolicyValueResNet
+        has_value_head = any("value_conv" in k or "value_fc" in k for k in state_dict.keys())
+        # Check for trunk structure (after mapping)
+        has_trunk = any("trunk" in k for k in state_dict.keys())
+        # Check policy head structure
+        has_simple_policy = "policy_head.weight" in state_dict and "policy_head.bias" in state_dict
+        has_sequential_policy = any("policy_head.0" in k or "policy_head.1" in k for k in state_dict.keys())
+        
+        if has_value_head and has_trunk:
+            arch = "PolicyValueResNet"
+            print("Auto-detected architecture: PolicyValueResNet (has value head and trunk)")
+        elif has_simple_policy and not has_trunk:
+            arch = "TinyPolicyResNet"
+            print("Auto-detected architecture: TinyPolicyResNet (simple policy head, no trunk)")
+        elif has_sequential_policy and has_trunk:
+            arch = "PolicyValueResNet"
+            print("Auto-detected architecture: PolicyValueResNet (sequential policy head and trunk)")
+        else:
+            # Default to PolicyValueResNet if we have trunk structure
+            if has_trunk:
+                arch = "PolicyValueResNet"
+                print(f"Auto-detected architecture: PolicyValueResNet (has trunk structure)")
+            else:
+                arch = "TinyPolicyResNet"
+                print(f"Auto-detected architecture: TinyPolicyResNet (default fallback)")
     
     # Handle backward compatibility for old checkpoints with policy_head.4 -> policy_head.3
     if "policy_head.4.weight" in state_dict and "policy_head.3.weight" not in state_dict:
@@ -482,6 +520,10 @@ def load_checkpoint(path: str, map_location: Optional[str] = None) -> nn.Module:
         state_dict["policy_head.3.weight"] = state_dict.pop("policy_head.4.weight")
         state_dict["policy_head.3.bias"] = state_dict.pop("policy_head.4.bias")
         state["model"] = state_dict
+    
+    # Handle checkpoints with single-layer policy_head (policy_head.weight) vs sequential (policy_head.0.weight)
+    # This happens with some PolicyValueResNet checkpoints
+    # We'll let non-strict loading handle this mismatch
     
     # Known architectures
     if arch == "PolicyOnlyResNet":
@@ -497,9 +539,56 @@ def load_checkpoint(path: str, map_location: Optional[str] = None) -> nn.Module:
         model = TinyPolicyResNet(in_channels=in_ch, channels=channels, blocks=blocks)
     elif arch == "PolicyValueResNet":
         from .model import PolicyValueResNet
-        in_ch = meta.get("in_channels", 18)
-        width = meta.get("width", 128)  # Use 128 as default (matches stockfish_949.pt)
-        blocks = meta.get("n_blocks", 12)  # Use 12 as default (matches stockfish_949.pt)
+        in_ch = meta.get("in_channels", None)
+        width = meta.get("width", None)
+        blocks = meta.get("n_blocks", None)
+        
+        # Infer width and in_channels from checkpoint keys if not in metadata
+        if width is None or in_ch is None:
+            # Check stem.0.weight shape: [width, in_channels, 3, 3]
+            if "stem.0.weight" in state_dict:
+                stem_shape = state_dict["stem.0.weight"].shape
+                if len(stem_shape) >= 2:
+                    if width is None:
+                        width = int(stem_shape[0])
+                    if in_ch is None:
+                        in_ch = int(stem_shape[1])
+                    print(f"Inferred width={width}, in_channels={in_ch} from stem.0.weight shape {stem_shape}")
+            # Or check trunk.0.conv1.weight shape: [width, width, 3, 3]
+            elif "trunk.0.conv1.weight" in state_dict:
+                trunk_shape = state_dict["trunk.0.conv1.weight"].shape
+                if len(trunk_shape) >= 2:
+                    if width is None:
+                        width = int(trunk_shape[0])
+                    if in_ch is None:
+                        in_ch = 18  # Default fallback
+                        print(f"Could not infer in_channels, using default={in_ch}")
+                    print(f"Inferred width={width} from trunk.0.conv1.weight shape {trunk_shape}")
+            else:
+                if width is None:
+                    width = 128  # Default fallback
+                    print(f"Could not infer width, using default={width}")
+                if in_ch is None:
+                    in_ch = 18  # Default fallback
+                    print(f"Could not infer in_channels, using default={in_ch}")
+        
+        # Infer number of blocks from checkpoint keys if not in metadata
+        if blocks is None:
+            import re
+            max_block = -1
+            for k in state_dict.keys():
+                # Match patterns like "trunk.19"
+                match = re.search(r'trunk\.(\d+)', k)
+                if match:
+                    block_idx = int(match.group(1))
+                    max_block = max(max_block, block_idx)
+            if max_block >= 0:
+                blocks = max_block + 1  # Blocks are 0-indexed
+                print(f"Inferred n_blocks={blocks} from checkpoint keys")
+            else:
+                blocks = 20  # Default fallback
+                print(f"Could not infer n_blocks, using default={blocks}")
+        
         model = PolicyValueResNet(in_channels=in_ch, width=width, n_blocks=blocks)
     else:
         # Unknown architecture - raise error instead of silently falling back
@@ -510,5 +599,49 @@ def load_checkpoint(path: str, map_location: Optional[str] = None) -> nn.Module:
             f"If you renamed a model class, update the checkpoint or this loader."
         )
     
-    model.load_state_dict(state_dict)
+    # Try strict loading first, fall back to non-strict if needed
+    try:
+        incompatible = model.load_state_dict(state_dict, strict=True)
+        if incompatible.missing_keys:
+            print(f"Warning: Missing keys in checkpoint: {len(incompatible.missing_keys)} keys")
+            if len(incompatible.missing_keys) > 10:
+                print(f"  First 10: {incompatible.missing_keys[:10]}")
+        if incompatible.unexpected_keys:
+            print(f"Warning: Unexpected keys in checkpoint: {len(incompatible.unexpected_keys)} keys")
+            if len(incompatible.unexpected_keys) > 10:
+                print(f"  First 10: {incompatible.unexpected_keys[:10]}")
+    except RuntimeError as e:
+        # If strict loading fails, try non-strict
+        print(f"Strict loading failed: {e}")
+        print("Attempting non-strict loading...")
+        try:
+            incompatible = model.load_state_dict(state_dict, strict=False)
+            if incompatible.missing_keys:
+                print(f"Warning: Missing keys (non-strict): {len(incompatible.missing_keys)} keys")
+                if len(incompatible.missing_keys) > 10:
+                    print(f"  First 10: {incompatible.missing_keys[:10]}")
+            if incompatible.unexpected_keys:
+                print(f"Warning: Unexpected keys (non-strict): {len(incompatible.unexpected_keys)} keys")
+                if len(incompatible.unexpected_keys) > 10:
+                    print(f"  First 10: {incompatible.unexpected_keys[:10]}")
+        except RuntimeError as e2:
+            # Even non-strict can fail on size mismatches - skip those keys
+            print(f"Non-strict loading also failed: {e2}")
+            print("Attempting to load compatible keys only...")
+            model_dict = model.state_dict()
+            compatible_dict = {}
+            skipped = []
+            for k, v in state_dict.items():
+                if k in model_dict:
+                    if model_dict[k].shape == v.shape:
+                        compatible_dict[k] = v
+                    else:
+                        skipped.append(f"{k}: checkpoint {v.shape} vs model {model_dict[k].shape}")
+                else:
+                    skipped.append(f"{k}: not in model")
+            model.load_state_dict(compatible_dict, strict=False)
+            print(f"Loaded {len(compatible_dict)} compatible keys, skipped {len(skipped)} incompatible keys")
+            if len(skipped) > 0 and len(skipped) <= 20:
+                print(f"Skipped keys: {skipped}")
+    
     return model

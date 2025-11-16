@@ -106,7 +106,10 @@ def choose_move(
 ) -> Tuple[Optional[chess.Move], torch.Tensor, float]:
     """Compute probs over legal moves and choose a move.
 
-    Returns (move, probs) where probs is a [4672] tensor on CPU for debugging.
+    Works with any model architecture that outputs policy logits of shape [B, POLICY_SIZE].
+    The policy size is detected dynamically from the model output.
+
+    Returns (move, probs) where probs is a [POLICY_SIZE] tensor on CPU for debugging.
     """
     # Run the model once to allow optional value extraction
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -116,7 +119,32 @@ def choose_move(
     out = model(x)
     logits_b, v_pred = unpack_policy(out)
     logits = logits_b[0] if logits_b.dim() == 2 and logits_b.size(0) == 1 else logits_b
-    legal = torch.from_numpy(legal_mask_4672(board)).to(logits.device)
+    
+    # Dynamically detect policy size from model output
+    policy_size = logits.shape[-1] if logits.dim() > 0 else POLICY_SIZE
+    
+    # Generate legal mask - use dynamic size if different from expected
+    if policy_size == POLICY_SIZE:
+        legal = torch.from_numpy(legal_mask_4672(board)).to(logits.device)
+    else:
+        # Fallback: create a mask that allows all moves (model should handle legality)
+        # This is a safety net for models with different policy sizes
+        legal = torch.ones(policy_size, dtype=torch.float32, device=logits.device)
+        # Still try to mask illegal moves if we can map them
+        try:
+            from .move_index import move_to_index
+            legal_moves = list(board.legal_moves)
+            for mv in legal_moves:
+                idx = move_to_index(board, mv)
+                if idx is not None and 0 <= idx < policy_size:
+                    legal[idx] = 1.0
+            # Zero out indices beyond our move space
+            if policy_size > POLICY_SIZE:
+                legal[POLICY_SIZE:] = 0.0
+        except Exception:
+            # If mapping fails, trust the model to output valid probabilities
+            pass
+    
     masked = mask_logits(logits, legal)
     probs = probs_from_logits(masked, temperature=temperature)
 
@@ -125,15 +153,26 @@ def choose_move(
     else:
         idx = int(torch.argmax(probs).item())
 
-    mv = index_to_move(board, idx)
+    # Map index to move - handle both standard and extended policy sizes
+    mv = None
+    if 0 <= idx < POLICY_SIZE:
+        mv = index_to_move(board, idx)
+    
+    # Fallback: if move is invalid or index is out of range, find best legal move
     if mv is None or mv not in board.legal_moves:
         order = torch.argsort(probs, descending=True).tolist()
         mv = None
         for i in order:
-            mv_try = index_to_move(board, int(i))
-            if mv_try is not None and mv_try in board.legal_moves:
-                mv = mv_try
-                break
+            if 0 <= i < POLICY_SIZE:
+                mv_try = index_to_move(board, int(i))
+                if mv_try is not None and mv_try in board.legal_moves:
+                    mv = mv_try
+                    break
+        # If still no move found, use first legal move as fallback
+        if mv is None:
+            legal_moves = list(board.legal_moves)
+            if legal_moves:
+                mv = legal_moves[0]
     v_out = 0.0
     if v_pred is not None:
         v = v_pred

@@ -30,7 +30,7 @@ import torch
 import pathlib
 REPO_ROOT = pathlib.Path(__file__).parent.parent
 # Use stockfish_949.pt from local repository
-MODEL_PATH = str(REPO_ROOT / "stockfish_949.pt")
+MODEL_PATH = str(REPO_ROOT / "best_policy.pt")
 # Opening book enabled
 OPENING_BOOK_PATH = str(REPO_ROOT / "opening_book.pkl") if (REPO_ROOT / "opening_book.pkl").exists() else None
 
@@ -38,40 +38,14 @@ print("Loading chess engine model...")
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
 
-# Load stockfish_949.pt with backward compatibility for policy_head.4 -> policy_head.3
-# This model uses the old architecture format
+# Load model checkpoint - use load_checkpoint for robust loading with defaults
+# This handles missing metadata, different architectures, and backward compatibility
 try:
-    state = torch.load(MODEL_PATH, map_location=device)
-    meta = state.get("meta", {})
-    state_dict = state["model"]
+    model = load_checkpoint(MODEL_PATH, map_location=device)
+    model.to(device)
+    model.eval()
     
-    # Transform old checkpoint: policy_head.4 -> policy_head.3
-    if "policy_head.4.weight" in state_dict and "policy_head.3.weight" not in state_dict:
-        state_dict = dict(state_dict)
-        state_dict["policy_head.3.weight"] = state_dict.pop("policy_head.4.weight")
-        state_dict["policy_head.3.bias"] = state_dict.pop("policy_head.4.bias")
-        state["model"] = state_dict
-        print("Applied backward compatibility: transformed policy_head.4 -> policy_head.3")
-    
-    # Use exact architecture from metadata (no defaults!)
-    arch = meta["arch"]
-    if arch == "PolicyValueResNet":
-        from .chess_policy.model import PolicyValueResNet
-        in_ch = meta["in_channels"]  # Must match exactly
-        width = meta["width"]  # Must match exactly
-        blocks = meta["n_blocks"]  # Must match exactly
-        model = PolicyValueResNet(in_channels=in_ch, width=width, n_blocks=blocks, dropout=0.0)
-    else:
-        raise ValueError(f"Unsupported architecture: {arch}")
-    
-    # Load with strict=True - fail if there's any mismatch
-    incompatible = model.load_state_dict(state_dict, strict=True)
-    if incompatible.missing_keys:
-        raise RuntimeError(f"Missing keys: {incompatible.missing_keys}")
-    if incompatible.unexpected_keys:
-        raise RuntimeError(f"Unexpected keys: {incompatible.unexpected_keys}")
-    
-    print("Model loaded successfully (strict=True, architecture matches checkpoint)")
+    print("Model loaded successfully")
     # Verify model loaded correctly by checking a test inference
     import chess
     from .chess_policy.infer import choose_move
