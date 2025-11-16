@@ -372,17 +372,13 @@ class UciEngine:
                     test_board_book = self.board.copy()
                     test_board_book.push(mv)
                     book_tree = SearchTree(test_board_book, self.model, quick_config)
-                    _, _ = book_tree.search()  # Run search to get evaluation
-                    # Get value from root node
-                    value_book_raw = book_tree.root.q_value if hasattr(book_tree, 'root') and book_tree.root.visit_count > 0 else 0.0
+                    _, _, value_book_raw = book_tree.search()  # Run search to get evaluation
                     value_book = -value_book_raw  # Negate: opponent's POV -> ours
                     
                     test_board_search = self.board.copy()
                     test_board_search.push(search_move)
                     search_tree = SearchTree(test_board_search, self.model, quick_config)
-                    _, _ = search_tree.search()  # Run search to get evaluation
-                    # Get value from root node
-                    value_search_raw = search_tree.root.q_value if hasattr(search_tree, 'root') and search_tree.root.visit_count > 0 else 0.0
+                    _, _, value_search_raw = search_tree.search()  # Run search to get evaluation
                     value_search = -value_search_raw  # Negate: opponent's POV -> ours
                     
                     # Very high threshold for opening to trust book more
@@ -440,7 +436,7 @@ class UciEngine:
                     self.search_tree = SearchTree(self.board, self.model, self.mcts_config)
             
             # Run search
-            mv, visit_dist = self.search_tree.search(
+            mv, visit_dist, root_value = self.search_tree.search(
                 available_time_ms=available_time_ms,
                 max_simulations_override=sims
             )
@@ -453,7 +449,7 @@ class UciEngine:
                 # If this position appeared in last 3 moves, try a different move
                 if test_fen in self._recent_positions[-3:]:
                     # Re-search with more simulations to potentially get different move
-                    mv, _ = self.search_tree.search(max_simulations_override=sims * 2)
+                    mv, _, _ = self.search_tree.search(max_simulations_override=sims * 2)
             
             # Log root value prediction (from current player's perspective)
             try:

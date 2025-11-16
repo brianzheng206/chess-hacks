@@ -163,7 +163,7 @@ def search_with_budget(engine, board, sims_cap, time_ms):
             use_dirichlet_noise=engine.mcts_config.use_dirichlet_noise,
         )
         temp_tree = SearchTree(board, engine.model, temp_config)
-        move, _ = temp_tree.search()
+        move, _, _ = temp_tree.search()
         
         elapsed = time.monotonic() - start
         # Allow a tiny top-up if we're way under budget (but cap it)
@@ -179,7 +179,7 @@ def search_with_budget(engine, board, sims_cap, time_ms):
                     use_dirichlet_noise=engine.mcts_config.use_dirichlet_noise,
                 )
                 temp_tree2 = SearchTree(board, engine.model, temp_config2)
-                move2, _ = temp_tree2.search()
+                move2, _, _ = temp_tree2.search()
                 if move2 is not None:
                     move = move2
         
@@ -508,17 +508,13 @@ def test_func(ctx: GameContext):
                     test_board_book = ctx.board.copy()
                     test_board_book.push(mv)
                     temp_tree_book = SearchTree(test_board_book, engine.model, quick_config)
-                    _, _ = temp_tree_book.search()
-                    # Get value from root node
-                    value_book_raw = temp_tree_book.root.q_value if hasattr(temp_tree_book, 'root') and temp_tree_book.root.visit_count > 0 else 0.0
+                    _, _, value_book_raw = temp_tree_book.search()
                     value_book = -value_book_raw  # Negate: opponent's perspective -> ours
                     
                     test_board_model = ctx.board.copy()
                     test_board_model.push(top_model_move)
                     temp_tree_model = SearchTree(test_board_model, engine.model, quick_config)
-                    _, _ = temp_tree_model.search()
-                    # Get value from root node
-                    value_model_raw = temp_tree_model.root.q_value if hasattr(temp_tree_model, 'root') and temp_tree_model.root.visit_count > 0 else 0.0
+                    _, _, value_model_raw = temp_tree_model.search()
                     value_model = -value_model_raw  # Negate: opponent's perspective -> ours
                     
                     # If model move is better or similar (within 0.1), use it
@@ -563,7 +559,7 @@ def test_func(ctx: GameContext):
                     use_dirichlet_noise=False,
                 )
                 quick_tree = SearchTree(ctx.board, engine.model, quick_config)
-                search_move, _ = quick_tree.search()
+                search_move, _, _ = quick_tree.search()
                 
                 if search_move is not None and search_move != mv:
                     # Compare values: get evaluation for both moves
@@ -572,17 +568,13 @@ def test_func(ctx: GameContext):
                     test_board_book = ctx.board.copy()
                     test_board_book.push(mv)
                     temp_tree_book = SearchTree(test_board_book, engine.model, quick_config)
-                    _, _ = temp_tree_book.search()
-                    # Get value from root node
-                    value_book_raw = temp_tree_book.root.q_value if hasattr(temp_tree_book, 'root') and temp_tree_book.root.visit_count > 0 else 0.0
+                    _, _, value_book_raw = temp_tree_book.search()
                     value_book = -value_book_raw  # Negate: opponent's perspective -> ours
                     
                     test_board_search = ctx.board.copy()
                     test_board_search.push(search_move)
                     temp_tree_search = SearchTree(test_board_search, engine.model, quick_config)
-                    _, _ = temp_tree_search.search()
-                    # Get value from root node
-                    value_search_raw = temp_tree_search.root.q_value if hasattr(temp_tree_search, 'root') and temp_tree_search.root.visit_count > 0 else 0.0
+                    _, _, value_search_raw = temp_tree_search.search()
                     value_search = -value_search_raw  # Negate: opponent's perspective -> ours
                     
                     # Adaptive threshold: higher for early opening and high-confidence book moves
@@ -646,7 +638,7 @@ def test_func(ctx: GameContext):
             
             # Search for best move
             search_start = time.monotonic()
-            mv, visit_dist = engine.search_tree.search(max_simulations_override=sims)
+            mv, visit_dist, root_value = engine.search_tree.search(max_simulations_override=sims)
             search_time = (time.monotonic() - search_start) * 1000
             print(f"Search: {search_time:.1f} ms (sims={sims})")
             
@@ -659,7 +651,7 @@ def test_func(ctx: GameContext):
                 if test_fen in engine._recent_positions[-3:]:
                     print("Warning: Best move leads to recent repetition, re-searching with more sims...")
                     # Re-search with more simulations to potentially get different move
-                    mv, _ = engine.search_tree.search(max_simulations_override=sims * 2)
+                    mv, _, _ = engine.search_tree.search(max_simulations_override=sims * 2)
             
             # Log root value prediction (from current player's perspective)
             if hasattr(engine.search_tree, 'root') and engine.search_tree.root.visit_count > 0:
