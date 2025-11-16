@@ -30,7 +30,7 @@ import torch
 import pathlib
 REPO_ROOT = pathlib.Path(__file__).parent.parent
 # Use stockfish_949.pt from local repository
-MODEL_PATH = str(REPO_ROOT / "stockfish_949.pt")
+MODEL_PATH = str(REPO_ROOT / "stockfish_949_fp16.pt")
 # Opening book enabled
 OPENING_BOOK_PATH = str(REPO_ROOT / "opening_book.pkl") if (REPO_ROOT / "opening_book.pkl").exists() else None
 
@@ -41,17 +41,16 @@ VALUE_EARLY_TERMINATION_MIN_PLY = 2       # allow earlier termination (was 4)
 # Debug flags - set to True only when debugging (significantly impacts performance)
 DEBUG_POLICY = False  # Enable verbose policy extraction and diagnostics
 DEBUG_TENSOR = False  # Enable raw tensor diagnostics
+DEBUG_MOVE_TIME = True  # Measure and print move time
 
-# Verbose output flag - set via environment variable or keep False for bullet games
-VERBOSE = os.getenv("VERBOSE", "False").lower() in ("true", "1", "yes")
+# Verbose output flag - set to False for bullet games to reduce I/O overhead
+VERBOSE = False
 
 # Pure policy bullet mode - skips MCTS entirely, just uses neural network policy
-# Set via environment variable or keep False for normal play
-PURE_POLICY_BULLET = os.getenv("PURE_POLICY_BULLET", "False").lower() in ("true", "1", "yes")
+PURE_POLICY_BULLET = False
 
 # Hybrid mode: use pure policy when time is low or game is advanced
-# Set via environment variable, defaults to True if PURE_POLICY_BULLET is enabled
-USE_HYBRID_MODE = os.getenv("USE_HYBRID_MODE", str(PURE_POLICY_BULLET)).lower() in ("true", "1", "yes")
+USE_HYBRID_MODE = True  # Only used if PURE_POLICY_BULLET is True
 HYBRID_TIME_THRESHOLD_MS = 30000  # Use pure policy when timeLeft < 30 seconds
 HYBRID_PLY_THRESHOLD = 20  # Use pure policy when ply > 20
 
@@ -316,6 +315,11 @@ def format_value_eval(value: float) -> str:
 def test_func(ctx: GameContext):
     # This gets called every time the model needs to make a move
     # Return a python-chess Move object that is a legal move for the current position
+    
+    # Measure total move time if debug is enabled
+    move_start_time = None
+    if DEBUG_MOVE_TIME:
+        move_start_time = time.monotonic()
 
     if VERBOSE:
         print("Cooking move with chess engine...")
@@ -572,6 +576,10 @@ def test_func(ctx: GameContext):
             ctx.logProbabilities(move_probs)
         else:
             ctx.logProbabilities({move: 1.0})
+        # Print move time if debug is enabled
+        if DEBUG_MOVE_TIME and move_start_time is not None:
+            move_time_ms = (time.monotonic() - move_start_time) * 1000
+            print(f"[DEBUG_MOVE_TIME] Total move time (pure policy): {move_time_ms:.1f} ms (ply {current_ply})")
         return move
     
     # ------------------------------
@@ -833,6 +841,10 @@ def test_func(ctx: GameContext):
                     engine._recent_positions.pop(0)
                 
                 ctx.logProbabilities(move_probs)
+                # Print move time if debug is enabled
+                if DEBUG_MOVE_TIME and move_start_time is not None:
+                    move_time_ms = (time.monotonic() - move_start_time) * 1000
+                    print(f"[DEBUG_MOVE_TIME] Total move time (opening book): {move_time_ms:.1f} ms (ply {current_ply})")
                 return move
             
             # For later opening moves (ply >= 4), compare with model if available
@@ -1205,6 +1217,11 @@ def test_func(ctx: GameContext):
                 move_prob = move_probs[move]
                 print(f"Move probability (from extracted probs): {move_prob:.4f} ({move_prob*100:.2f}%)")
         
+        # Print move time if debug is enabled
+        if DEBUG_MOVE_TIME and move_start_time is not None:
+            move_time_ms = (time.monotonic() - move_start_time) * 1000
+            print(f"[DEBUG_MOVE_TIME] Total move time: {move_time_ms:.1f} ms (ply {current_ply})")
+        
         return move
         
     except Exception as e:
@@ -1213,7 +1230,14 @@ def test_func(ctx: GameContext):
         traceback.print_exc()
         # Fallback to the policy move we already computed
         move = policy_move if policy_move is not None and policy_move in legal_moves else legal_move_list[0]
-        print(f"Selected move (exception fallback): {move.uci()}")  # NEW
+        print(f"Selected move (exception fallback): {move.uci()}")
+        
+        # Print move time if debug is enabled (even on exception)
+        if DEBUG_MOVE_TIME and move_start_time is not None:
+            move_time_ms = (time.monotonic() - move_start_time) * 1000
+            current_ply = len(ctx.board.move_stack) if hasattr(ctx, 'board') else 0
+            print(f"[DEBUG_MOVE_TIME] Total move time (exception): {move_time_ms:.1f} ms (ply {current_ply})")
+        
         return move
 
 
