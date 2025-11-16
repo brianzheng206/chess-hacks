@@ -48,6 +48,8 @@ OPENING_QUICK_SEARCH = False  # Enable quick MCTS search to find better opening 
 
 # Time management flags
 LOW_TIME_SKIP_MCTS_MS = 8000  # Skip MCTS entirely when time drops below this (8 seconds, tune this)
+CRITICAL_TIME_SKIP_MCTS_MS = 5000  # Force greedy policy when time is critically low (5 seconds)
+LOSING_BADLY_THRESHOLD = -0.8  # Force greedy policy when losing very badly (value < -0.9)
 
 print("Loading chess engine model...")
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -227,23 +229,32 @@ def value_to_sims_scale(value: float) -> float:
     Args:
         value: Evaluation from the perspective of the side to move, in [-1, 1].
             - abs(value) near 0 → unclear position → scale ~1.0 (full search)
-            - abs(value) near 1 → clearly winning/losing → scale ~0.2 (very reduced search)
+            - abs(value) near 1 → clearly winning/losing → scale ~0.15 (very reduced search)
+            - For losing positions (value < -0.3), use even more aggressive scaling
     
     Returns:
-        Scale factor in [0.2, 1.0] for adjusting simulation count (more aggressive for speed).
+        Scale factor in [0.15, 1.0] for adjusting simulation count (more aggressive for speed).
     """
     abs_value = abs(float(value))
+    value_float = float(value)
     
-    # More aggressive scaling: abs_value 0.0 → scale 1.0, abs_value 1.0 → scale 0.2
-    # For very winning positions (abs_value >= 0.85), use even more aggressive scaling
-    if abs_value >= 0.85:
-        scale = 0.15  # Very aggressive for clearly winning/losing positions
+    # More aggressive scaling for losing positions - when losing, search less
+    if value_float < -0.3:  # Losing position
+        # For losing positions, be very aggressive: scale down more
+        if abs_value >= 0.85:
+            scale = 0.10  # Very aggressive for clearly losing positions
+        elif abs_value >= 0.5:
+            scale = 0.20  # Aggressive for moderately losing positions
+        else:
+            scale = 0.35  # Still reduce for slightly losing positions (like -0.417)
+    elif abs_value >= 0.85:  # Very winning/losing (but winning)
+        scale = 0.15  # Very aggressive for clearly winning positions
     else:
         # Linear mapping: abs_value 0.0 → scale 1.0, abs_value 0.85 → scale ~0.32
         scale = 1.0 - 0.8 * abs_value
     
-    # Clamp to [0.2, 1.0] to ensure reasonable bounds
-    return max(0.2, min(1.0, scale))
+    # Clamp to [0.15, 1.0] to ensure reasonable bounds
+    return max(0.15, min(1.0, scale))
 
 
 def format_value_eval(value: float) -> str:
@@ -608,7 +619,7 @@ def test_func(ctx: GameContext):
     # Strategy: Trust policy more, reduce search in all phases for faster moves
     # TUNE: Adjust phase-specific parameters if blunders occur in specific phases
     if game_phase > 0.7:  # Opening
-        sims = min(sims, 50)  # Reduced from 65 - opening is usually book moves
+        sims = min(sims, 40)  # Reduced from 50 - opening is usually book moves, prioritize speed
         if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
             engine.mcts_config.c_puct = 0.8  # Reduced from 1.0 - trust policy more
     elif game_phase < 0.3:  # Endgame
@@ -657,14 +668,25 @@ def test_func(ctx: GameContext):
     # ------------------------------
     # NEW: Adjust sims based on position clarity (value magnitude)
     # Unclear positions (value ~0) get full search, clear positions (|value| ~1) get reduced search
+    # Losing positions get even more aggressive reduction
     if value is not None and not early_termination:
         scale = value_to_sims_scale(float(value))
         sims_before = sims
-        # More aggressive minimum: 10 sims for very winning positions, 15 for others
+        value_float = float(value)
         abs_value = abs(float(value))
-        min_sims = 10 if abs_value >= 0.85 else 15
+        
+        # More aggressive minimums for losing/winning positions
+        if abs_value >= 0.85:
+            min_sims = 8  # Very winning/losing - minimal search
+        elif value_float < -0.3:  # Losing position
+            min_sims = 8  # Losing - very minimal search (same as very winning/losing)
+        elif abs_value >= 0.5:
+            min_sims = 10  # Moderately winning/losing
+        else:
+            min_sims = 12  # Unclear positions
+        
         sims = max(min_sims, int(sims * scale))
-        print(f"Value-aware sims scaling: value={float(value):+.3f}, scale={scale:.2f}, sims {sims_before} → {sims}")
+        print(f"Value-aware sims scaling: value={value_float:+.3f}, scale={scale:.2f}, sims {sims_before} → {sims}")
     
     # ------------------------------
     # STEP 3: SELECTION STRATEGY (using UCI engine logic)
@@ -871,12 +893,44 @@ def test_func(ctx: GameContext):
             return move
         
         # Use model/MCTS for non-opening positions
+        # NEW: Force greedy policy in critical situations (critical time or losing badly)
+        # Check for critical time (very low on clock)
+        critical_time = movetime_ms > 0 and movetime_ms < CRITICAL_TIME_SKIP_MCTS_MS
+        # Check for losing badly (very negative value)
+        losing_badly = value is not None and float(value) < LOSING_BADLY_THRESHOLD
+        
+        # Force greedy policy if critical time or losing badly
+        force_greedy = critical_time or losing_badly
+        if force_greedy:
+            if critical_time:
+                decision_mode = "Greedy policy (critical time)"
+                print(f"Decision mode: {decision_mode} (movetime_ms={movetime_ms:.0f}ms, ply {current_ply})")
+            elif losing_badly:
+                decision_mode = "Greedy policy (losing badly)"
+                print(f"Decision mode: {decision_mode} (value={float(value):+.3f}, ply {current_ply})")
+            
+            # Use greedy policy - just take the model's top move
+            try:
+                mv, _, _ = choose_move(ctx.board, model, device=device, temperature=0.8, sample=False)
+                move = mv
+                print(f"Using greedy policy move: {move.uci()}")
+            except Exception as e:
+                # Fallback if choose_move fails
+                print(f"info string Error in greedy selection: {e}", file=sys.stderr)
+                # Fallback to policy_move or first legal move
+                if policy_move is not None and policy_move in legal_moves:
+                    move = policy_move
+                    print(f"Fallback to policy_move: {move.uci()}")
+                else:
+                    move = legal_move_list[0]
+                    print(f"Fallback to first legal move: {move.uci()}")
         # NEW: Skip PUCT if early termination is triggered (extreme value magnitude)
         # NEW: Skip MCTS if low on time (use greedy policy for speed)
-        skip_mcts_for_time = movetime_ms > 0 and movetime_ms < LOW_TIME_SKIP_MCTS_MS
-        if not early_termination and not skip_mcts_for_time and engine.use_puct and hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
-            decision_mode = "MCTS search"
-            print(f"Decision mode: {decision_mode} (ply {current_ply}, phase={game_phase:.2f})")
+        elif not early_termination:
+            skip_mcts_for_time = movetime_ms > 0 and movetime_ms < LOW_TIME_SKIP_MCTS_MS
+            if not skip_mcts_for_time and engine.use_puct and hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
+                decision_mode = "MCTS search"
+                print(f"Decision mode: {decision_mode} (ply {current_ply}, phase={game_phase:.2f})")
             
             # Initialize or update search tree
             from .chess_policy.mcts import SearchTree
