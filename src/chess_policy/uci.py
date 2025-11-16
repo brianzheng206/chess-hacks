@@ -275,8 +275,24 @@ class UciEngine:
         # Very early opening (ply 0-5): use top move deterministically for consistency
         # This ensures opening_trust_book works correctly and prevents MCTS from overpowering
         if current_ply <= 5:
-            # In very early opening, always pick the top move for consistency
-            return candidates[0][0]
+            # In very early opening, prefer the top move, but filter out obviously weak moves
+            # Filter out moves that are generally considered weak in opening (e.g., f5, g5, h5, b5, a5)
+            # These are often gambits or weak moves that shouldn't be played automatically
+            weak_moves = {'f7f5', 'f2f4', 'g7g5', 'g2g4', 'h7h5', 'h2h4', 'b7b5', 'b2b4', 'a7a5', 'a2a4'}
+            
+            # If top move is weak and there's a better alternative, prefer the alternative
+            top_move = candidates[0][0]
+            if top_move.uci() in weak_moves and len(candidates) > 1:
+                # Check if second move is not weak and has reasonable weight
+                second_move, second_weight = candidates[1]
+                if second_move.uci() not in weak_moves and second_weight > 0.4:
+                    # Use second move if it's significantly better (within 20% of top weight)
+                    top_weight = candidates[0][1]
+                    if second_weight >= top_weight * 0.8:
+                        return second_move
+            
+            # Otherwise, use top move
+            return top_move
         elif current_ply < 8:
             effective_temp = self.opening_temperature * 0.5  # More deterministic early
         else:

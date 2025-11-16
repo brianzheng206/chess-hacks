@@ -40,68 +40,97 @@ print(f"Using device: {device}")
 
 # Load model checkpoint - use load_checkpoint for robust loading with defaults
 # This handles missing metadata, different architectures, and backward compatibility
+# IMPORTANT: Model loading errors should not prevent server startup
+# The server needs to be able to start even if model loading fails initially
+model = None
 try:
-    model = load_checkpoint(MODEL_PATH, map_location=device)
-    model.to(device)
-    model.eval()
-    
-    print("Model loaded successfully")
-    # Verify model loaded correctly by checking a test inference
-    import chess
-    from .chess_policy.infer import choose_move
-    from .chess_policy.move_index import move_to_index
-    test_board = chess.Board()
-    test_board.push(chess.Move.from_uci('e2e4'))
-    test_move, test_probs, test_value = choose_move(test_board, model, device=device, temperature=0.7, sample=False)
-    test_legal = list(test_board.generate_legal_moves())
-    test_probs_dict = {}
-    # Check ALL legal moves, not just first 5
-    for mv in test_legal:
-        try:
-            idx = move_to_index(test_board, mv)
-            if idx is not None and idx < len(test_probs):
-                test_probs_dict[mv] = float(test_probs[idx].item())
-        except:
-            pass
-    if test_probs_dict:
-        test_total = sum(test_probs_dict.values())
-        test_max = max(test_probs_dict.values()) if test_probs_dict else 0
-        # Normalize to see actual probabilities
-        if test_total > 0:
-            test_probs_normalized = {mv: p / test_total for mv, p in test_probs_dict.items()}
-            test_max_norm = max(test_probs_normalized.values())
-            sorted_test = sorted(test_probs_normalized.items(), key=lambda x: x[1], reverse=True)
-            print(f"Model verification: max prob={test_max_norm:.4f} ({test_max_norm*100:.1f}%), sum={test_total:.4f}")
-            print(f"  Top 3 moves: {[(mv.uci(), f'{p*100:.1f}%') for mv, p in sorted_test[:3]]}")
-        if test_max < 0.1 or test_total < 0.5:
-            print("WARNING: Model probabilities are very low - model may not have loaded correctly!")
-            print(f"  This suggests the model weights may not have loaded properly.")
-        else:
-            print(f"Model verification passed: top move has {test_max*100:.1f}% probability")
+    if not os.path.exists(MODEL_PATH):
+        print(f"WARNING: Model file not found at {MODEL_PATH}")
+        print("Server will start but model-dependent features will not work")
+    else:
+        model = load_checkpoint(MODEL_PATH, map_location=device)
+        model.to(device)
+        model.eval()
+        
+        print("Model loaded successfully")
+        # Verify model loaded correctly by checking a test inference
+        import chess
+        from .chess_policy.infer import choose_move
+        from .chess_policy.move_index import move_to_index
+        test_board = chess.Board()
+        test_board.push(chess.Move.from_uci('e2e4'))
+        test_move, test_probs, test_value = choose_move(test_board, model, device=device, temperature=0.7, sample=False)
+        test_legal = list(test_board.generate_legal_moves())
+        test_probs_dict = {}
+        # Check ALL legal moves, not just first 5
+        for mv in test_legal:
+            try:
+                idx = move_to_index(test_board, mv)
+                if idx is not None and idx < len(test_probs):
+                    test_probs_dict[mv] = float(test_probs[idx].item())
+            except:
+                pass
+        if test_probs_dict:
+            test_total = sum(test_probs_dict.values())
+            test_max = max(test_probs_dict.values()) if test_probs_dict else 0
+            # Normalize to see actual probabilities
+            if test_total > 0:
+                test_probs_normalized = {mv: p / test_total for mv, p in test_probs_dict.items()}
+                test_max_norm = max(test_probs_normalized.values())
+                sorted_test = sorted(test_probs_normalized.items(), key=lambda x: x[1], reverse=True)
+                print(f"Model verification: max prob={test_max_norm:.4f} ({test_max_norm*100:.1f}%), sum={test_total:.4f}")
+                print(f"  Top 3 moves: {[(mv.uci(), f'{p*100:.1f}%') for mv, p in sorted_test[:3]]}")
+            if test_max < 0.1 or test_total < 0.5:
+                print("WARNING: Model probabilities are very low - model may not have loaded correctly!")
+                print(f"  This suggests the model weights may not have loaded properly.")
+            else:
+                print(f"Model verification passed: top move has {test_max*100:.1f}% probability")
 except Exception as e:
-    print(f"Error loading model: {e}")
+    print(f"ERROR: Failed to load model: {e}")
     import traceback
     traceback.print_exc()
-    raise
+    print("WARNING: Server will start but model-dependent features will not work")
+    print("This may be expected in deployment environments - model will be loaded on first request")
+    # Don't raise - allow server to start even if model loading fails
+    model = None
 
 # Performance optimizations: set model to eval mode and disable gradients
-model.eval()
+if model is not None:
+    model.eval()
 torch.set_grad_enabled(False)
 
 # Note: Warm-up is skipped to allow server to start quickly
 # The first move will naturally warm up the model, and the performance impact is minimal
 
-# Create UCI engine with PUCT search
-engine = UciEngine(
-    model,
-    use_puct=True,
-    sims=200,  # Increased simulations for better convergence
-    c_puct=0.8,  # Lower PUCT to trust policy more, less exploration
-    device=device,
-    opening_book_path=OPENING_BOOK_PATH,
-    opening_max_ply=8,
-)
-print("Chess engine initialized")
+# Create UCI engine with PUCT search (only if model loaded successfully)
+# Optimized for 1-minute games: fast, efficient, trusts policy more
+# TUNING GUIDE: See MCTS_TUNING_GUIDE.md for detailed parameter tuning instructions
+# Key parameters:
+#   - sims: Number of MCTS simulations (higher = stronger but slower, default: 150 for 1-min)
+#   - c_puct: Exploration constant (lower = trust policy more, default: 0.6 for 1-min)
+#     * 0.5-0.6: Very conservative, trusts policy heavily (good for fast games)
+#     * 0.7-0.8: Balanced
+#     * 1.0-1.2: More exploration, may find hidden tactics but also blunders
+engine = None
+if model is not None:
+    try:
+        engine = UciEngine(
+            model,
+            use_puct=True,
+            sims=150,  # Lower default for 1-min games (will be adjusted by time management)
+            c_puct=0.6,  # Lower to trust policy more, faster convergence for 1-min games
+            device=device,
+            opening_book_path=OPENING_BOOK_PATH,
+            opening_max_ply=8,
+        )
+        print("Chess engine initialized")
+    except Exception as e:
+        print(f"ERROR: Failed to initialize UCI engine: {e}")
+        import traceback
+        traceback.print_exc()
+        engine = None
+else:
+    print("WARNING: Chess engine not initialized - model not loaded")
 
 # FEN-based caching for neural network evaluations
 # This avoids re-evaluating the same position multiple times
@@ -189,6 +218,15 @@ def test_func(ctx: GameContext):
         ctx.logProbabilities({})
         raise ValueError("No legal moves available (i probably lost didn't i)")
 
+    # Check if engine is initialized
+    if engine is None or model is None:
+        print("ERROR: Engine or model not initialized - cannot make move")
+        # Fallback: return first legal move
+        move = legal_moves[0]
+        move_probs = {move: 1.0}
+        ctx.logProbabilities(move_probs)
+        return move
+
     # Update engine's board to match current position
     engine.board = ctx.board.copy()
     
@@ -214,8 +252,12 @@ def test_func(ctx: GameContext):
     # Calculate current ply for opening book check
     current_ply = len(ctx.board.move_stack)
     
+    # OPTIMIZATION: For very early opening (first 4 moves), skip NN evaluation
+    # and go straight to opening book for maximum speed
+    skip_nn_eval = current_ply < 4
+    
     # -------------------------
-    # STEP 1: POLICY EVALUATION
+    # STEP 1: POLICY EVALUATION (skip for very early opening)
     # -------------------------
     policy_move = None
     probs_tensor = None
@@ -223,149 +265,150 @@ def test_func(ctx: GameContext):
     sorted_moves = []   # NEW: always defined as list
     move_probs = {}     # NEW: initialize here for logging
 
-    # Determine temperature based on game phase
-    if current_ply < 12:
-        # Opening: use lower temperature for more deterministic play
-        temperature = 0.7
-    else:
-        # Mid/endgame: slightly higher temperature
-        temperature = 0.8
-    
-    # Single forward pass - compute policy once with timing
-    nn_start = time.monotonic()
-    try:
-        policy_move, probs_tensor, value = choose_move(
-            ctx.board,
-            model,
-            device=device,
-            temperature=temperature,
-            sample=False
-        )
-        nn_time = (time.monotonic() - nn_start) * 1000
-        if nn_time > 10:  # Only print if it's significant
-            print(f"NN forward (root): {nn_time:.1f} ms")
-        
-        # Ensure we got a valid move
-        if policy_move is None or policy_move not in legal_moves:
-            print("Warning: choose_move returned invalid move, using first legal move")
-            policy_move = legal_move_list[0]
-        
-        # Convert probabilities tensor to dictionary of Move -> probability for logging
-        # Use move_to_index to map moves to indices (more reliable than index_to_move)
-        from .chess_policy.move_index import move_to_index
-        
-        move_probs = {}
-        
-        # Get probabilities for legal moves only
-        # The probs_tensor is already normalized over all 4672 indices
-        # We extract probabilities by mapping each legal move to its index
-        if probs_tensor is not None:
-            # Iterate through all legal moves and get their probabilities
-            failed_moves = []
-            for move in legal_move_list:
-                try:
-                    # Get the index for this move
-                    move_idx = move_to_index(ctx.board, move)
-                    if move_idx is not None and 0 <= move_idx < len(probs_tensor):
-                        prob = float(probs_tensor[move_idx].item())
-                        # Some moves might have multiple indices (underpromotions), take max
-                        if move not in move_probs or prob > move_probs[move]:
-                            move_probs[move] = prob
-                    else:
-                        failed_moves.append((move, move_idx))
-                except (ValueError, AttributeError, TypeError) as e:
-                    # move_to_index can raise ValueError for some edge cases
-                    failed_moves.append((move, f"Exception: {e}"))
+    # Only run NN evaluation if not in very early opening
+    if not skip_nn_eval:
+        try:
+            # Determine temperature based on game phase
+            if current_ply < 12:
+                # Opening: use lower temperature for more deterministic play
+                temperature = 0.7
+            else:
+                # Mid/endgame: slightly higher temperature
+                temperature = 0.8
             
-            # Debug: warn if we failed to extract probabilities for many moves
-            if len(failed_moves) > 0:
-                print(f"Warning: Failed to extract probabilities for {len(failed_moves)} moves")
-                if len(failed_moves) <= 5:
-                    for mv, reason in failed_moves:
-                        print(f"  {mv.uci()}: {reason}")
+            # Single forward pass - compute policy once with timing
+            nn_start = time.monotonic()
+            policy_move, probs_tensor, value = choose_move(
+                ctx.board,
+                model,
+                device=device,
+                temperature=temperature,
+                sample=False
+            )
+            nn_time = (time.monotonic() - nn_start) * 1000
+            if nn_time > 10:  # Only print if it's significant
+                print(f"NN forward (root): {nn_time:.1f} ms")
             
-            # Verify we got probabilities for the policy_move
-            if policy_move is not None and policy_move not in move_probs:
-                print(f"WARNING: policy_move {policy_move.uci()} not in move_probs! Trying to extract...")
-                try:
-                    policy_idx = move_to_index(ctx.board, policy_move)
-                    if policy_idx is not None and 0 <= policy_idx < len(probs_tensor):
-                        policy_prob = float(probs_tensor[policy_idx].item())
-                        move_probs[policy_move] = policy_prob
-                        print(f"  Extracted policy_move prob: {policy_prob:.6f}")
-                except Exception as e:
-                    print(f"  Failed to extract policy_move prob: {e}")
-        
-        # The probabilities are already normalized in probs_tensor, but we only extracted legal moves
-        # So they should sum to ~1.0 (minus tiny probabilities on illegal moves)
-        # We don't need to normalize again - the probabilities are correct as-is
-        total_prob = sum(move_probs.values())
-        
-        # Debug: Check probability distribution
-        max_prob = max(move_probs.values()) if move_probs else 0
-        
-        # Always check the raw tensor to see what the model actually output
-        if probs_tensor is not None:
-            from .chess_policy.encoding import legal_mask_4672
-            legal_mask = legal_mask_4672(ctx.board)
-            legal_probs_raw = [float(probs_tensor[i].item()) for i in range(len(probs_tensor)) if legal_mask[i] > 0.5]
-            if legal_probs_raw:
-                legal_max_raw = max(legal_probs_raw)
-                legal_sum_raw = sum(legal_probs_raw)
-                print(f"Raw tensor check: max_legal={legal_max_raw:.6f}, sum_legal={legal_sum_raw:.6f}, extracted_max={max_prob:.6f}, extracted_count={len(move_probs)}")
-                # If there's a big discrepancy, something is wrong with extraction
-                if abs(legal_max_raw - max_prob) > 0.1:
-                    print(f"WARNING: Raw tensor max ({legal_max_raw:.6f}) doesn't match extracted max ({max_prob:.6f})!")
-        
-        # Debug output to diagnose probability issues
-        # Always print debug info if probabilities are suspiciously uniform/low
-        if max_prob < 0.15 or (max_prob < 0.2 and len(legal_move_list) > 15):
-            print(f"DEBUG: Probabilities seem low/uniform")
-            print(f"  Position: {ctx.board.fen()[:50]}...")
-            print(f"  Extracted probs: max={max_prob:.4f}, sum={total_prob:.4f}, legal_moves={len(legal_move_list)}")
-            # Check if probs_tensor itself has low values
+            # Ensure we got a valid move
+            if policy_move is None or policy_move not in legal_moves:
+                print("Warning: choose_move returned invalid move, using first legal move")
+                policy_move = legal_move_list[0]
+            
+            # Convert probabilities tensor to dictionary of Move -> probability for logging
+            # Use move_to_index to map moves to indices (more reliable than index_to_move)
+            from .chess_policy.move_index import move_to_index
+            
+            move_probs = {}
+            
+            # Get probabilities for legal moves only
+            # The probs_tensor is already normalized over all 4672 indices
+            # We extract probabilities by mapping each legal move to its index
             if probs_tensor is not None:
-                probs_max = float(probs_tensor.max().item())
-                probs_sum = float(probs_tensor.sum().item())
+                # Iterate through all legal moves and get their probabilities
+                failed_moves = []
+                for move in legal_move_list:
+                    try:
+                        # Get the index for this move
+                        move_idx = move_to_index(ctx.board, move)
+                        if move_idx is not None and 0 <= move_idx < len(probs_tensor):
+                            prob = float(probs_tensor[move_idx].item())
+                            # Some moves might have multiple indices (underpromotions), take max
+                            if move not in move_probs or prob > move_probs[move]:
+                                move_probs[move] = prob
+                        else:
+                            failed_moves.append((move, move_idx))
+                    except (ValueError, AttributeError, TypeError) as e:
+                        # move_to_index can raise ValueError for some edge cases
+                        failed_moves.append((move, f"Exception: {e}"))
+                
+                # Debug: warn if we failed to extract probabilities for many moves
+                if len(failed_moves) > 0:
+                    print(f"Warning: Failed to extract probabilities for {len(failed_moves)} moves")
+                    if len(failed_moves) <= 5:
+                        for mv, reason in failed_moves:
+                            print(f"  {mv.uci()}: {reason}")
+                
+                # Verify we got probabilities for the policy_move
+                if policy_move is not None and policy_move not in move_probs:
+                    print(f"WARNING: policy_move {policy_move.uci()} not in move_probs! Trying to extract...")
+                    try:
+                        policy_idx = move_to_index(ctx.board, policy_move)
+                        if policy_idx is not None and 0 <= policy_idx < len(probs_tensor):
+                            policy_prob = float(probs_tensor[policy_idx].item())
+                            move_probs[policy_move] = policy_prob
+                            print(f"  Extracted policy_move prob: {policy_prob:.6f}")
+                    except Exception as e:
+                        print(f"  Failed to extract policy_move prob: {e}")
+            
+            # The probabilities are already normalized in probs_tensor, but we only extracted legal moves
+            # So they should sum to ~1.0 (minus tiny probabilities on illegal moves)
+            # We don't need to normalize again - the probabilities are correct as-is
+            total_prob = sum(move_probs.values())
+            
+            # Debug: Check probability distribution
+            max_prob = max(move_probs.values()) if move_probs else 0
+            
+            # Always check the raw tensor to see what the model actually output
+            if probs_tensor is not None and move_probs:
+                from .chess_policy.encoding import legal_mask_4672
                 legal_mask = legal_mask_4672(ctx.board)
                 legal_probs_raw = [float(probs_tensor[i].item()) for i in range(len(probs_tensor)) if legal_mask[i] > 0.5]
-                legal_max_raw = max(legal_probs_raw) if legal_probs_raw else 0
-                legal_sum_raw = sum(legal_probs_raw) if legal_probs_raw else 0
-                print(f"  probs_tensor: max={probs_max:.4f}, sum={probs_sum:.4f}, shape={probs_tensor.shape}")
-                print(f"  Legal moves in tensor: max={legal_max_raw:.4f}, sum={legal_sum_raw:.4f}, count={len(legal_probs_raw)}")
-                if legal_sum_raw < 0.5:
-                    print(f"  WARNING: Legal moves sum to only {legal_sum_raw:.4f} - model may not be confident or extraction is wrong!")
-                if abs(total_prob - legal_sum_raw) > 0.1:
-                    print(f"  WARNING: Extracted probs sum ({total_prob:.4f}) doesn't match legal_sum_raw ({legal_sum_raw:.4f}) - extraction may be incomplete!")
-        
-        # Print top 5 moves with probabilities (for logging/debugging only)
-        # Note: These are extracted probabilities for logging - policy_move is the ground truth
-        sorted_moves = sorted(move_probs.items(), key=lambda x: x[1], reverse=True)
-        top_5 = sorted_moves[:5]
-        print("Top 5 moves from model (for logging):")
-        for i, (move, prob) in enumerate(top_5, 1):
-            marker = "✓" if move == policy_move else " "
-            print(f"  {marker} {i}. {move.uci()}: {prob:.4f} ({prob*100:.2f}%)")
-        
-        # policy_move from choose_move is the model's actual argmax - this is what we use for selection
-        if policy_move is not None:
-            policy_prob = move_probs.get(policy_move, 0.0) if move_probs else 0.0
-            print(f"Using policy_move (model's argmax): {policy_move.uci()} (prob={policy_prob:.4f})")
+                if legal_probs_raw:
+                    legal_max_raw = max(legal_probs_raw)
+                    legal_sum_raw = sum(legal_probs_raw)
+                    print(f"Raw tensor check: max_legal={legal_max_raw:.6f}, sum_legal={legal_sum_raw:.6f}, extracted_max={max_prob:.6f}, extracted_count={len(move_probs)}")
+                    # If there's a big discrepancy, something is wrong with extraction
+                    if abs(legal_max_raw - max_prob) > 0.1:
+                        print(f"WARNING: Raw tensor max ({legal_max_raw:.6f}) doesn't match extracted max ({max_prob:.6f})!")
+            
+            # Debug output to diagnose probability issues
+            # Always print debug info if probabilities are suspiciously uniform/low
+            if max_prob < 0.15 or (max_prob < 0.2 and len(legal_move_list) > 15):
+                print(f"DEBUG: Probabilities seem low/uniform")
+                print(f"  Position: {ctx.board.fen()[:50]}...")
+                print(f"  Extracted probs: max={max_prob:.4f}, sum={total_prob:.4f}, legal_moves={len(legal_move_list)}")
+                # Check if probs_tensor itself has low values
+                if probs_tensor is not None:
+                    probs_max = float(probs_tensor.max().item())
+                    probs_sum = float(probs_tensor.sum().item())
+                    legal_mask = legal_mask_4672(ctx.board)
+                    legal_probs_raw = [float(probs_tensor[i].item()) for i in range(len(probs_tensor)) if legal_mask[i] > 0.5]
+                    legal_max_raw = max(legal_probs_raw) if legal_probs_raw else 0
+                    legal_sum_raw = sum(legal_probs_raw) if legal_probs_raw else 0
+                    print(f"  probs_tensor: max={probs_max:.4f}, sum={probs_sum:.4f}, shape={probs_tensor.shape}")
+                    print(f"  Legal moves in tensor: max={legal_max_raw:.4f}, sum={legal_sum_raw:.4f}, count={len(legal_probs_raw)}")
+                    if legal_sum_raw < 0.5:
+                        print(f"  WARNING: Legal moves sum to only {legal_sum_raw:.4f} - model may not be confident or extraction is wrong!")
+                    if abs(total_prob - legal_sum_raw) > 0.1:
+                        print(f"  WARNING: Extracted probs sum ({total_prob:.4f}) doesn't match legal_sum_raw ({legal_sum_raw:.4f}) - extraction may be incomplete!")
+            
+            # Print top 5 moves with probabilities (for logging/debugging only)
+            # Note: These are extracted probabilities for logging - policy_move is the ground truth
+            sorted_moves = sorted(move_probs.items(), key=lambda x: x[1], reverse=True)
+            top_5 = sorted_moves[:5]
+            print("Top 5 moves from model (for logging):")
+            for i, (move, prob) in enumerate(top_5, 1):
+                marker = "✓" if move == policy_move else " "
+                print(f"  {marker} {i}. {move.uci()}: {prob:.4f} ({prob*100:.2f}%)")
+            
+            # policy_move from choose_move is the model's actual argmax - this is what we use for selection
+            if policy_move is not None:
+                policy_prob = move_probs.get(policy_move, 0.0) if move_probs else 0.0
+                print(f"Using policy_move (model's argmax): {policy_move.uci()} (prob={policy_prob:.4f})")
 
-        # Log probabilities for downstream tooling
-        try:
-            ctx.logProbabilities(move_probs)
-        except Exception as log_err:
-            print(f"Warning: logProbabilities failed: {log_err}")
+            # Log probabilities for downstream tooling
+            try:
+                ctx.logProbabilities(move_probs)
+            except Exception as log_err:
+                print(f"Warning: logProbabilities failed: {log_err}")
+                import traceback
+                traceback.print_exc()
+        except Exception as e:
+            print(f"Warning: Could not compute probabilities: {e}")
             import traceback
             traceback.print_exc()
-
-    except Exception as e:
-        print(f"Warning: Could not compute probabilities: {e}")
-        import traceback
-        traceback.print_exc()
-        # Fallback: uniform distribution and use first legal move
-        move_probs = {move: 1.0 / len(legal_move_list) for move in legal_move_list}
+            # Fallback: uniform distribution and use first legal move
+            move_probs = {move: 1.0 / len(legal_move_list) for move in legal_move_list}
         sorted_moves = sorted(move_probs.items(), key=lambda x: x[1], reverse=True)
         try:
             ctx.logProbabilities(move_probs)
@@ -388,24 +431,97 @@ def test_func(ctx: GameContext):
     # Default sims from engine config
     sims = engine.sims
     if ctx.timeLeft > 0:
-        # Map time to simulations: ~100 sims per second heuristic (reduced from 400)
+        # Dynamic time management: adapt simulations based on available time
+        # Optimized for 1-minute games: very conservative time usage
         movetime_ms = ctx.timeLeft
-        estimated_sims = max(50, int(movetime_ms * 0.1))  # Much more conservative
-        sims = min(estimated_sims, 250)  # Reduced cap from 800 to 250
+        
+        # For 1-minute games, be very conservative with time usage
+        # Estimate moves remaining (assume ~35-40 moves per game for 1-min)
+        # Use 1.5-2% of remaining time per move to ensure we finish the game
+        moves_remaining_estimate = max(8, int(movetime_ms / 1200))  # Slightly more conservative
+        time_per_move_ms = movetime_ms / max(moves_remaining_estimate, 1)
+        
+        # Adaptive simulation rate based on time per move (optimized for speed)
+        # In 1-min games, prioritize speed and efficiency
+        if time_per_move_ms > 2500:  # >2.5 seconds per move: can search more
+            sims_per_sec = 100
+        elif time_per_move_ms > 1200:  # 1.2-2.5 seconds: moderate search
+            sims_per_sec = 80
+        elif time_per_move_ms > 600:  # 0.6-1.2 seconds: fast search
+            sims_per_sec = 60
+        elif time_per_move_ms > 300:  # 0.3-0.6 seconds: very fast
+            sims_per_sec = 50
+        else:  # <0.3 seconds: critical, minimal search
+            sims_per_sec = 35  # Very minimal, trust policy heavily
+        
+        # Use conservative time budget: only use 75% of estimated time per move
+        # Reserve 25% for safety and overhead (more conservative for 1-min games)
+        time_budget_ms = time_per_move_ms * 0.75
+        estimated_sims = max(15, int(time_budget_ms * sims_per_sec / 1000.0))
+        
+        # Cap simulations based on time remaining (very conservative for 1-min games)
+        if movetime_ms > 40000:  # >40 seconds left (early game)
+            max_sims = 150
+        elif movetime_ms > 25000:  # 25-40 seconds
+            max_sims = 120
+        elif movetime_ms > 15000:  # 15-25 seconds
+            max_sims = 100
+        elif movetime_ms > 8000:  # 8-15 seconds
+            max_sims = 80
+        elif movetime_ms > 4000:  # 4-8 seconds
+            max_sims = 60
+        elif movetime_ms > 2000:  # 2-4 seconds
+            max_sims = 40
+        else:  # <2 seconds: critical time
+            max_sims = 25  # Very minimal search, trust policy heavily
+        
+        sims = min(estimated_sims, max_sims)
+        
+        # Additional time pressure handling (aggressive for 1-min games)
+        if movetime_ms < 15000:  # Less than 15 seconds
+            sims = min(sims, 80)
+        if movetime_ms < 8000:  # Less than 8 seconds
+            sims = min(sims, 50)
+        if movetime_ms < 4000:  # Less than 4 seconds
+            sims = min(sims, 35)
+        if movetime_ms < 2000:  # Less than 2 seconds
+            sims = min(sims, 20)
     
-    # Phase-aware adjustments
+    # Phase-aware adjustments (optimized for 1-minute games)
+    # Strategy: Careful in midgame, efficient in endgame when time is low
+    # TUNE: Adjust phase-specific parameters if blunders occur in specific phases
     if game_phase > 0.7:  # Opening
-        sims = min(sims, 120)
+        sims = min(sims, 80)  # Very low cap for 1-min games (opening is usually book moves)
         if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
-            engine.mcts_config.c_puct = 1.4
+            engine.mcts_config.c_puct = 1.0  # Moderate exploration in opening
     elif game_phase < 0.3:  # Endgame
-        sims = min(sims, 150)
-        if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
-            engine.mcts_config.c_puct = 0.7  # Lower in endgame - trust policy more
-    else:  # Midgame
-        sims = min(sims, 200)
-        if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
-            engine.mcts_config.c_puct = 0.8  # Lower to trust policy more
+        # In endgame, be very efficient when time is low - trust policy heavily
+        if movetime_ms < 8000:  # Less than 8 seconds: time pressure
+            sims = min(sims, 50)  # Very low cap when time is low
+            if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
+                engine.mcts_config.c_puct = 0.4  # Trust policy very heavily in time trouble
+        elif movetime_ms < 15000:  # 8-15 seconds: moderate time
+            sims = min(sims, 70)
+            if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
+                engine.mcts_config.c_puct = 0.5  # Trust policy heavily
+        else:  # >15 seconds: can search more
+            sims = min(sims, 90)
+            if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
+                engine.mcts_config.c_puct = 0.5  # Still trust policy, but can search
+    else:  # Midgame - BE CAREFUL, search more
+        # Midgame is critical - use more simulations and be more thorough
+        if movetime_ms > 30000:  # Plenty of time: search carefully
+            sims = min(sims, 150)  # Higher cap for careful search (but still reasonable for 1-min)
+            if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
+                engine.mcts_config.c_puct = 0.6  # Balanced, trust policy but explore
+        elif movetime_ms > 15000:  # Moderate time: still careful
+            sims = min(sims, 120)
+            if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
+                engine.mcts_config.c_puct = 0.6
+        else:  # Time pressure: reduce but still careful
+            sims = min(sims, 90)  # Still more than endgame
+            if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
+                engine.mcts_config.c_puct = 0.5  # Trust policy more when time is low
     
     # ------------------------------
     # STEP 3: SELECTION STRATEGY (using UCI engine logic)
@@ -454,6 +570,28 @@ def test_func(ctx: GameContext):
         # Check opening book (if in opening phase and no tactical opportunity found)
         mv = engine._get_opening_move()
         if mv is not None:
+            # OPTIMIZATION: For very early opening (ply < 4), use opening book immediately
+            # Skip model comparison to save time
+            if skip_nn_eval:
+                decision_mode = "Opening book (fast)"
+                move = mv
+                print(f"Decision mode: {decision_mode} (ply {current_ply})")
+                print(f"Using opening book move: {move.uci()}")
+                
+                # Create simple move_probs for logging
+                move_probs = {move: 1.0}
+                
+                # Track position after move
+                test_board = ctx.board.copy()
+                test_board.push(mv)
+                engine._recent_positions.append(test_board.fen())
+                if len(engine._recent_positions) > 10:
+                    engine._recent_positions.pop(0)
+                
+                ctx.logProbabilities(move_probs)
+                return move
+            
+            # For later opening moves (ply >= 4), compare with model if available
             # Get opening book move confidence (weight of selected move)
             fen = ctx.board.fen()
             book_moves = engine.opening_book.get(fen, []) if engine.opening_book else []
@@ -618,13 +756,20 @@ def test_func(ctx: GameContext):
             
             # Policy trust check: if top policy move has much higher probability than MCTS choice,
             # and MCTS choice has low policy probability, trust the policy instead
+            # TUNE: Adjust these thresholds if you see blunders:
+            #   - Lower top_policy_prob threshold (0.10-0.12) = more aggressive override
+            #   - Raise mcts_policy_prob threshold (0.06-0.08) = catch more bad MCTS choices
+            #   - Lower multiplier (2.5-2.8) = override when difference is smaller
             if mv is not None and policy_move is not None:
                 mcts_policy_prob = move_probs.get(mv, 0.0) if move_probs else 0.0
                 top_policy_prob = move_probs.get(policy_move, 0.0) if move_probs else 0.0
                 
-                # If top policy move has >3x the probability of MCTS choice, and MCTS choice is <5%,
-                # trust the policy (likely MCTS is exploring a bad line)
-                if top_policy_prob > 0.15 and mcts_policy_prob < 0.05 and top_policy_prob > mcts_policy_prob * 3.0:
+                # TUNE: Optimized for 1-min games - more aggressive override
+                # Current thresholds: top > 12%, MCTS < 6%, top is 2.5x higher
+                # More aggressive than before to catch blunders faster in quick games
+                # Make even more aggressive: top > 0.10, MCTS < 0.08, multiplier > 2.0
+                # Make less aggressive: top > 0.20, MCTS < 0.04, multiplier > 4.0
+                if top_policy_prob > 0.12 and mcts_policy_prob < 0.06 and top_policy_prob > mcts_policy_prob * 2.5:
                     print(f"Policy trust override: MCTS chose {mv.uci()} (prob={mcts_policy_prob:.4f}), "
                           f"but policy top move {policy_move.uci()} has prob={top_policy_prob:.4f} "
                           f"({top_policy_prob/mcts_policy_prob:.1f}x higher). Using policy move.")
