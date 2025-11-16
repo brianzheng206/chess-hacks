@@ -8,7 +8,7 @@ predictions to guide exploration and selection.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Protocol, Tuple, TYPE_CHECKING, Optional, Dict, Any, Callable
+from typing import Protocol, Tuple, TYPE_CHECKING, Optional, Dict, Any, Callable, List
 import math
 import threading
 
@@ -54,6 +54,35 @@ def _get_transposition_key(state: GameState) -> Optional[int]:
             pass
     return None
 
+
+def _position_key_from_state(state: GameState) -> str:
+    """Get cache key for a position from any state object (Board, GameState, etc.).
+    
+    Uses transposition_key if available (fast & collision-resistant), else FEN.
+    Works directly with the state object without constructing new Board objects.
+    
+    Args:
+        state: Any object with transposition_key (property or method) and/or fen() method.
+    
+    Returns:
+        String key with prefix "tt:" for transposition keys or "fen:" for FEN strings.
+        This avoids collisions between transposition keys and FEN strings.
+    """
+    # Try transposition_key first (faster)
+    tt_key = _get_transposition_key(state)
+    if tt_key is not None:
+        return f"tt:{tt_key}"
+    
+    # Fallback to FEN
+    if hasattr(state, 'fen'):
+        try:
+            return f"fen:{state.fen()}"
+        except Exception:
+            pass
+    
+    # Last resort: try to convert to string (shouldn't happen in practice)
+    return f"fen:{str(state)}"
+
 def is_tactical_move(board: Any, move: Any) -> bool:
     """Returns True if the move is a check or a capture.
     
@@ -93,6 +122,90 @@ def is_tactical_move(board: Any, move: Any) -> bool:
         pass
     
     return False
+
+
+def move_order_score(board: Any, move: Any) -> int:
+    """Calculate move ordering score using MVV-LVA (Most Valuable Victim, Least Valuable Attacker).
+    
+    Higher scores indicate better moves that should be explored first.
+    This helps MCTS find tactics faster by prioritizing:
+    - Captures (especially high-value captures)
+    - Checks
+    - Promotions
+    - Quiet moves (lowest priority)
+    
+    Args:
+        board: A chess board object (e.g., chess.Board) that supports:
+            - is_capture(move) -> bool
+            - piece_at(square) -> piece or None
+            - push(move) -> None
+            - is_check() -> bool
+            - pop() -> None
+        move: A chess move object (e.g., chess.Move).
+    
+    Returns:
+        Integer score for move ordering:
+        - 10000+ : Captures (higher = more valuable victim)
+        - 5000+  : Checks (non-captures)
+        - 1000+  : Promotions (non-captures, non-checks)
+        - 0      : Quiet moves
+    """
+    if not CHESS_AVAILABLE:
+        return 0
+    
+    try:
+        score = 0
+        
+        # Check if move is a capture (MVV-LVA: Most Valuable Victim, Least Valuable Attacker)
+        if hasattr(board, 'is_capture') and board.is_capture(move):
+            # Get piece values for MVV-LVA
+            # Piece values: Pawn=1, Knight=3, Bishop=3, Rook=5, Queen=9, King=0 (shouldn't capture)
+            piece_values = {1: 1, 2: 3, 3: 3, 4: 5, 5: 9, 6: 0}  # Pawn, Knight, Bishop, Rook, Queen, King
+            
+            # Get captured piece value (victim)
+            if hasattr(board, 'piece_at') and hasattr(move, 'to_square'):
+                captured_piece = board.piece_at(move.to_square)
+                if captured_piece is not None:
+                    # Get piece type (1=pawn, 2=knight, 3=bishop, 4=rook, 5=queen, 6=king)
+                    piece_type = captured_piece.piece_type if hasattr(captured_piece, 'piece_type') else 0
+                    victim_value = piece_values.get(piece_type, 0)
+                    
+                    # Get capturing piece value (attacker)
+                    if hasattr(move, 'from_square'):
+                        attacker_piece = board.piece_at(move.from_square)
+                        if attacker_piece is not None:
+                            attacker_type = attacker_piece.piece_type if hasattr(attacker_piece, 'piece_type') else 0
+                            attacker_value = piece_values.get(attacker_type, 0)
+                            
+                            # MVV-LVA: Higher score for valuable victim, lower for valuable attacker
+                            # Score = 10000 + (victim_value * 100) - attacker_value
+                            # This ensures: QxP > QxR > PxQ (queen takes pawn > queen takes rook > pawn takes queen)
+                            score = 10000 + (victim_value * 100) - attacker_value
+                else:
+                    # Fallback: just mark as capture
+                    score = 10000
+            else:
+                # Fallback: just mark as capture
+                score = 10000
+        
+        # Check if move gives check (non-capture checks)
+        if score == 0 and hasattr(board, 'push') and hasattr(board, 'is_check') and hasattr(board, 'pop'):
+            board.push(move)
+            gives_check = board.is_check()
+            board.pop()
+            if gives_check:
+                score = 5000
+        
+        # Check if move is a promotion (non-capture, non-check promotions)
+        if score == 0 and hasattr(move, 'promotion') and move.promotion is not None:
+            score = 1000
+        
+        # Quiet moves get score 0 (lowest priority)
+        return score
+        
+    except (AttributeError, TypeError, ValueError):
+        # If board doesn't support these operations, return 0 (quiet move)
+        return 0
 
 if TYPE_CHECKING:
     # Type hints for chess move and board objects
@@ -186,7 +299,7 @@ class SearchConfig:
     device: torch.device | str = "cuda" if torch.cuda.is_available() else "cpu"
     min_policy_moves: int = 12
     epsilon_prior: float = 1e-4
-    tactical_bonus: float = 0.02
+    tactical_bonus: float = 0.03  # Increased from 0.02 to help find tactics faster
     min_simulations: int = 50
     max_simulations: int = 1000
     fast_mode: bool = False
@@ -240,6 +353,12 @@ class SearchNode:
         terminal_value: If terminal, the exact outcome from current player's POV in [-1, 0, 1].
             -1 = loss, 0 = draw, +1 = win.
         to_play: The side to move at this node (+1 for white, -1 for black, or similar encoding).
+        legal_moves: Cached list of legal moves at this position. Computed lazily when node is expanded.
+        legal_mask: Cached [4672] float32 numpy array with 1.0 for legal moves, 0.0 otherwise.
+            Computed lazily when node is expanded.
+        policy_logits: Cached policy logits from neural network evaluation. Raw logits before
+            Dirichlet noise. Shape: [POLICY_SIZE] tensor on CPU. Stored when node is expanded.
+        value: Cached value prediction from neural network. Range: [-1, 1]. Stored when node is expanded.
     
     Properties:
         q_value: Average value estimate Q(s,a) = value_sum / visit_count, or 0.0 if unvisited.
@@ -252,7 +371,8 @@ class SearchNode:
         - See BatchEvaluator docstring for more details on parallel MCTS requirements.
     """
     __slots__ = ('parent', 'children', 'prior', 'visit_count', 'value_sum', 'state', 
-                 'is_expanded', 'is_terminal', 'terminal_value', 'to_play', 'fen')
+                 'is_expanded', 'is_terminal', 'terminal_value', 'to_play', 'fen',
+                 'legal_moves', 'legal_mask', 'policy_logits', 'value')
     
     def __init__(
         self,
@@ -281,6 +401,14 @@ class SearchNode:
         self.to_play = to_play
         # Cache FEN to avoid repeated computation (micro-optimization)
         self.fen: Optional[str] = state.fen() if state is not None and hasattr(state, 'fen') else None
+        # Cache legal moves and legal mask to avoid repeated computation
+        # These are computed lazily when the node is expanded
+        self.legal_moves: Optional[List[AnyMoveType]] = None
+        self.legal_mask: Optional[np.ndarray] = None  # [4672] float32 array with 1.0 for legal moves
+        # Cache policy logits and value to avoid redundant neural network evaluations
+        # These are stored when the node is expanded (raw logits, before Dirichlet noise)
+        self.policy_logits: Optional[torch.Tensor] = None  # [POLICY_SIZE] tensor on CPU
+        self.value: Optional[float] = None  # Value prediction in [-1, 1]
     
     def clear(self) -> None:
         """Clear all children and reset node state (useful for tree reuse)."""
@@ -288,6 +416,12 @@ class SearchNode:
         self.is_expanded = False
         self.visit_count = 0
         self.value_sum = 0.0
+        # Clear cached legal moves and mask when clearing node
+        self.legal_moves = None
+        self.legal_mask = None
+        # Clear cached policy logits and value
+        self.policy_logits = None
+        self.value = None
     
     @property
     def q_value(self) -> float:
@@ -698,8 +832,9 @@ def select_child(node: SearchNode, c_puct: float, config: Optional[SearchConfig]
     best_score = float('-inf')
     
     # Iterate through children and calculate PUCT score for each
-    # Use sorted order for deterministic tie-breaking
-    for move, child in sorted(node.children.items(), key=lambda x: str(x[0])):
+    # Use move ordering (MVV-LVA) for tie-breaking: captures/checks first
+    # This helps MCTS find tactics faster when PUCT scores are similar
+    for move, child in sorted(node.children.items(), key=lambda x: (move_order_score(node.state, x[0]) if node.state is not None else 0, str(x[0])), reverse=True):
         Q = child.q_value
         P = child.prior
         n = child.visit_count
@@ -780,7 +915,7 @@ class BatchEvaluator:
         # Thread-safe data structures (locks are cheap, provide safety for future multi-threading)
         self._lock = threading.Lock()  # Lock for thread-safe access to shared state
         self.pending_states: list[Tuple[GameState, object]] = []  # (state, callback_data)
-        self.results_cache: Dict[str, Tuple[torch.Tensor, float]] = {}  # FEN -> (logits, value)
+        self.results_cache: Dict[str, Tuple[torch.Tensor, float]] = {}  # Position key (tt:... or fen:...) -> (logits, value)
         self.stats_batched = 0  # Number of states evaluated in batches
         self.stats_single = 0  # Number of states evaluated individually
         self.stats_cached = 0  # Number of cache hits
@@ -794,10 +929,10 @@ class BatchEvaluator:
             state: Game state to evaluate.
             callback_data: Optional data to associate with this state (e.g., node reference).
         """
-        # Use FEN as cache key
-        fen = state.fen() if hasattr(state, 'fen') else str(state)
+        # Use transposition_key if available (faster), else FEN
+        cache_key = _position_key_from_state(state)
         with self._lock:
-            if fen not in self.results_cache:
+            if cache_key not in self.results_cache:
                 self.pending_states.append((state, callback_data))
     
     def evaluate_batch(self) -> None:
@@ -824,7 +959,7 @@ class BatchEvaluator:
             
             # Encode all states in batch (CPU encoding, but we'll move to GPU in one go)
             batch_tensors = []
-            batch_fens = []
+            batch_cache_keys = []
             
             # Get model's expected channel count once
             try:
@@ -845,8 +980,9 @@ class BatchEvaluator:
                     x_np = np.concatenate([x_np, pad], axis=0)
                 
                 batch_tensors.append(x_np)
-                fen = state.fen() if hasattr(state, 'fen') else str(state)
-                batch_fens.append(fen)
+                # Use transposition_key if available (faster), else FEN
+                cache_key = _position_key_from_state(state)
+                batch_cache_keys.append(cache_key)
             
             # Stack into batch tensor [B, C, 8, 8] and move to GPU in one operation
             batch_x = np.stack(batch_tensors, axis=0)
@@ -878,10 +1014,10 @@ class BatchEvaluator:
                 # Cache results for each state (now using CPU tensors)
                 # Thread-safe: acquire lock to update cache
                 with self._lock:
-                    for i, fen in enumerate(batch_fens):
+                    for i, cache_key in enumerate(batch_cache_keys):
                         logits = logits_cpu[i]
                         value = float(values_cpu[i])
-                        self.results_cache[fen] = (logits, value)
+                        self.results_cache[cache_key] = (logits, value)
                     
                     # Update stats
                     self.stats_batched += len(batch_states)
@@ -910,9 +1046,10 @@ class BatchEvaluator:
         Returns:
             Tuple of (logits, value) if cached, None otherwise.
         """
-        fen = state.fen() if hasattr(state, 'fen') else str(state)
+        # Use transposition_key if available (faster), else FEN
+        cache_key = _position_key_from_state(state)
         with self._lock:
-            return self.results_cache.get(fen)
+            return self.results_cache.get(cache_key)
     
     def get_result_and_mark_cached(self, state: GameState) -> Optional[Tuple[torch.Tensor, float]]:
         """Get cached result for a state and increment cache hit stats if found.
@@ -925,9 +1062,10 @@ class BatchEvaluator:
         Returns:
             Tuple of (logits, value) if cached, None otherwise.
         """
-        fen = state.fen() if hasattr(state, 'fen') else str(state)
+        # Use transposition_key if available (faster), else FEN
+        cache_key = _position_key_from_state(state)
         with self._lock:
-            res = self.results_cache.get(fen)
+            res = self.results_cache.get(cache_key)
             if res is not None:
                 self.stats_cached += 1
             return res
@@ -944,8 +1082,9 @@ class BatchEvaluator:
             In single-threaded MCTS (current implementation), this returns True when
             pending_count >= 1, meaning each state is evaluated immediately. This means
             we're not really "batching" multiple states together - batches are effectively
-            size 1. The main benefit is caching: the FEN cache prevents re-evaluating
-            the same position across different simulations and searches.
+            size 1. The main benefit is caching: the position cache (using transposition_key
+            when available, FEN as fallback) prevents re-evaluating the same position across
+            different simulations and searches.
             
             For true GPU batching (evaluating multiple states in parallel), you would need
             to refactor mcts_search to:
@@ -987,9 +1126,10 @@ class BatchEvaluator:
             value: Value prediction.
             is_single: If True, increment single evaluation stats.
         """
-        fen = state.fen() if hasattr(state, 'fen') else str(state)
+        # Use transposition_key if available (faster), else FEN
+        cache_key = _position_key_from_state(state)
         with self._lock:
-            self.results_cache[fen] = (logits, value)
+            self.results_cache[cache_key] = (logits, value)
             if is_single:
                 self.stats_single += 1
     
@@ -1236,14 +1376,26 @@ def expand_node(
         node.is_expanded = True
         node.state = state
         
+        # Cache empty legal moves and mask for terminal nodes
+        if node.legal_moves is None:
+            node.legal_moves = []
+            # Create empty legal mask (all zeros)
+            from .encoding import POLICY_SIZE
+            node.legal_mask = np.zeros((POLICY_SIZE,), dtype=np.float32)
+        
         # No children in terminal positions - return immediately
         return node.terminal_value
     
     # Non-terminal: evaluate with model
     # Only reach here if state.is_game_over() is False
     # The neural network value is from the POV of state.turn (the side to move) in [-1, 1]
-    # Use precomputed evaluation if available (typically for root node to avoid redundant NN pass)
-    if precomputed_policy_logits is not None and precomputed_value is not None:
+    # Use cached evaluation if available, otherwise use precomputed or evaluate
+    if node.policy_logits is not None and node.value is not None:
+        # Use cached evaluation from node (already computed)
+        device = torch.device(config.device) if isinstance(config.device, str) else config.device
+        policy_logits = node.policy_logits.to(device)
+        value = node.value
+    elif precomputed_policy_logits is not None and precomputed_value is not None:
         # Use precomputed evaluation - ensure logits are on correct device
         device = torch.device(config.device) if isinstance(config.device, str) else config.device
         if precomputed_policy_logits.device != device:
@@ -1254,6 +1406,9 @@ def expand_node(
         # Cache the result in batch_evaluator for consistency
         if batch_evaluator is not None:
             batch_evaluator.cache_single_result(state, policy_logits.cpu(), value)
+        # Store in node for future use
+        node.policy_logits = policy_logits.cpu()
+        node.value = value
     else:
         # Evaluate with model (normal case for non-root nodes)
         device = torch.device(config.device) if isinstance(config.device, str) else config.device
@@ -1262,10 +1417,23 @@ def expand_node(
             position_cache_get=position_cache_get,
             position_cache_set=position_cache_set,
         )
+        # Store in node for future use (move to CPU for caching)
+        node.policy_logits = policy_logits.cpu() if policy_logits.device.type != 'cpu' else policy_logits
+        node.value = value
     
-    # Get legal moves and build mask
-    legal_moves = list(state.generate_legal_moves())
-    legal_mask = legal_mask_4672(state)
+    # Get legal moves and build mask (use cached values if available)
+    if node.legal_moves is not None and node.legal_mask is not None:
+        # Use cached values - already computed for this node
+        legal_moves = node.legal_moves
+        legal_mask = node.legal_mask
+    else:
+        # Compute and cache legal moves and mask
+        legal_moves = list(state.generate_legal_moves())
+        legal_mask = legal_mask_4672(state)
+        # Cache for future use
+        node.legal_moves = legal_moves
+        node.legal_mask = legal_mask
+    
     legal_mask_tensor = torch.from_numpy(legal_mask).to(policy_logits.device)
     
     # Mask illegal moves: set logits for illegal moves to -inf
@@ -1279,23 +1447,26 @@ def expand_node(
     probs = F.softmax(masked_logits, dim=0)
     
     # Build priors dictionary: Dict[Move, float]
-    # Keep track of move-index pairs for sorting
-    move_probs: list[Tuple[AnyMoveType, float]] = []
+    # Optimized: first build move->indices mapping, then compute max prob per move
+    # This is O(N) instead of O(N²) and handles duplicate indices (underpromotions) correctly
+    move_to_idx_map: Dict[AnyMoveType, List[int]] = {}
     for move in legal_moves:
         try:
             idx = move_to_index(state, move)
             if idx is not None and 0 <= idx < len(probs):
-                prob = float(probs[idx].item())
-                # If multiple indices map to same move (e.g., underpromotions), take max
-                # Check if we already have this move with a higher probability
-                existing_prob = next((p for m, p in move_probs if m == move), None)
-                if existing_prob is None or prob > existing_prob:
-                    # Remove old entry if exists
-                    move_probs = [(m, p) for m, p in move_probs if m != move]
-                    move_probs.append((move, prob))
+                # Use setdefault to append to list (handles multiple indices per move)
+                move_to_idx_map.setdefault(move, []).append(idx)
         except (ValueError, AttributeError, TypeError):
             # Skip moves that can't be indexed
             continue
+    
+    # Compute max probability for each move across all its indices
+    # For underpromotions, multiple indices map to the same move - take max
+    move_probs: list[Tuple[AnyMoveType, float]] = []
+    for move, indices in move_to_idx_map.items():
+        # Get max probability across all indices for this move
+        max_prob = max(probs[i].item() for i in indices if 0 <= i < len(probs))
+        move_probs.append((move, float(max_prob)))
     
     # Enforce minimum policy moves: keep at least top K moves by prior
     # This helps keep unusual gambits (like Scholar's mate) alive long enough
@@ -1328,6 +1499,14 @@ def expand_node(
         uniform_prob = 1.0 / len(legal_moves) if legal_moves else 0.0
         priors = {move: uniform_prob for move in legal_moves}
     
+    # Sort priors by move order score (MVV-LVA) to improve child expansion order
+    # This helps MCTS find tactics faster by exploring captures/checks first
+    # We create an OrderedDict to preserve order when expanding children
+    from collections import OrderedDict
+    sorted_priors = OrderedDict(
+        sorted(priors.items(), key=lambda x: move_order_score(state, x[0]), reverse=True)
+    )
+    
     # Determine to_play (assuming chess.Board-like interface)
     # For python-chess: chess.WHITE = True, chess.BLACK = False
     # Convert to +1/-1 encoding
@@ -1348,8 +1527,8 @@ def expand_node(
             elif isinstance(state.turn, int):
                 to_play = state.turn if state.turn in (1, -1) else 1
     
-    # Expand the node
-    node.expand(priors, state, to_play, is_terminal=False, terminal_value=None)
+    # Expand the node with ordered priors (captures/checks first)
+    node.expand(sorted_priors, state, to_play, is_terminal=False, terminal_value=None)
     
     return value
 
@@ -1650,9 +1829,11 @@ def mcts_search(
                 position_cache_set=position_cache_set,
             )
         else:
-            # Root already expanded, get value from root's Q-value or use precomputed value
-            # If root has been visited, use Q-value; otherwise use precomputed or evaluate
-            if root.visit_count > 0:
+            # Root already expanded, get value from cached value, Q-value, or precomputed value
+            # Priority: cached value > Q-value (if visited) > precomputed > evaluate
+            if root.value is not None:
+                current_root_value = root.value
+            elif root.visit_count > 0:
                 current_root_value = root.q_value
             elif root_value is not None:
                 current_root_value = root_value
@@ -1714,8 +1895,8 @@ def mcts_search(
     # Blunder detection: if value jumped significantly in our favor, double simulations
     # prev_root_value is from opponent's POV, current_root_value is from our POV
     # To compare: flip prev_root_value to our POV (opponent's value from their POV -> our POV)
-    # Tuning: Try threshold 0.3 instead of 0.5 if your value head tends to be conservative
-    value_jump_threshold = 0.5
+    # Lower threshold to catch more blunder opportunities (0.3 catches smaller but significant jumps)
+    value_jump_threshold = 0.3
     if prev_root_value is not None:
         # Flip prev_root_value to our POV (opponent's value from their POV -> our POV)
         prev_root_value_our_pov = -prev_root_value
@@ -1742,7 +1923,11 @@ def mcts_search(
         # Terminal position: return appropriate move and distribution
         # For checkmate/stalemate, we still need to return a move
         # If there are no legal moves, we can't return a move - this is an error case
-        legal_moves = list(root_state.generate_legal_moves()) if hasattr(root_state, 'generate_legal_moves') else []
+        # Use cached legal moves if available
+        if root.legal_moves is not None:
+            legal_moves = root.legal_moves
+        else:
+            legal_moves = list(root_state.generate_legal_moves()) if hasattr(root_state, 'generate_legal_moves') else []
         if not legal_moves:
             # No legal moves - game is over
             # Create zero distribution and return None move (or first move if any exist)
@@ -1843,20 +2028,29 @@ def mcts_search(
         pi = torch.full_like(visit_counts, 1.0 / len(visit_counts))
     
     # Get policy distribution over the same moves
-    # Recompute policy logits for root state to get fresh policy distribution
+    # Use cached policy logits from root node if available (avoids redundant NN evaluation)
     # This ensures we have the original network policy (not affected by Dirichlet noise)
     from .encoding import legal_mask_4672
     device = torch.device(config.device) if isinstance(config.device, str) else config.device
-    # Pass batch_evaluator to reuse cached result (root was already evaluated during expansion)
-    policy_logits, _ = evaluate_state_with_model(
-        root_state, model, device, batch_evaluator,
-        position_cache_get=position_cache_get,
-        position_cache_set=position_cache_set,
-    )
+    if root.policy_logits is not None:
+        # Use cached policy logits from root node (already computed during expansion)
+        policy_logits = root.policy_logits.to(device)
+    else:
+        # Fallback: evaluate if not cached (shouldn't happen if root was expanded)
+        policy_logits, _ = evaluate_state_with_model(
+            root_state, model, device, batch_evaluator,
+            position_cache_get=position_cache_get,
+            position_cache_set=position_cache_set,
+        )
     
     # Get legal moves and build policy distribution p over the same move order
-    legal_moves = list(root_state.generate_legal_moves())
-    legal_mask = legal_mask_4672(root_state)
+    # Use cached values from root node if available
+    if root.legal_moves is not None and root.legal_mask is not None:
+        legal_moves = root.legal_moves
+        legal_mask = root.legal_mask
+    else:
+        legal_moves = list(root_state.generate_legal_moves())
+        legal_mask = legal_mask_4672(root_state)
     legal_mask_tensor = torch.from_numpy(legal_mask).to(policy_logits.device)
     
     # Mask illegal moves and softmax to get policy probabilities
@@ -1978,7 +2172,11 @@ def mcts_search(
         visit_dist = visit_dist / total_prob
     else:
         # Fallback: if no moves were successfully mapped, create uniform over legal moves
-        legal_moves = list(root_state.generate_legal_moves()) if hasattr(root_state, 'generate_legal_moves') else []
+        # Use cached legal moves if available
+        if root.legal_moves is not None:
+            legal_moves = root.legal_moves
+        else:
+            legal_moves = list(root_state.generate_legal_moves()) if hasattr(root_state, 'generate_legal_moves') else []
         if legal_moves:
             uniform_prob = 1.0 / len(legal_moves)
             for move in legal_moves:
@@ -2019,14 +2217,24 @@ def debug_root_stats(
     from .encoding import legal_mask_4672
     
     device = torch.device(config.device) if isinstance(config.device, str) else config.device
-    policy_logits, _ = evaluate_state_with_model(
-        root_state, model, device,
-        position_cache_get=position_cache_get,
-        position_cache_set=position_cache_set,
-    )
+    # Use cached policy logits from root node if available (avoids redundant NN evaluation)
+    if root.policy_logits is not None:
+        policy_logits = root.policy_logits.to(device)
+    else:
+        # Fallback: evaluate if not cached
+        policy_logits, _ = evaluate_state_with_model(
+            root_state, model, device,
+            position_cache_get=position_cache_get,
+            position_cache_set=position_cache_set,
+        )
     
-    legal_moves = list(root_state.generate_legal_moves())
-    legal_mask = legal_mask_4672(root_state)
+    # Use cached legal moves and mask from root node if available
+    if root.legal_moves is not None and root.legal_mask is not None:
+        legal_moves = root.legal_moves
+        legal_mask = root.legal_mask
+    else:
+        legal_moves = list(root_state.generate_legal_moves())
+        legal_mask = legal_mask_4672(root_state)
     legal_mask_tensor = torch.from_numpy(legal_mask).to(policy_logits.device)
     masked_logits = torch.where(
         legal_mask_tensor > 0.5,

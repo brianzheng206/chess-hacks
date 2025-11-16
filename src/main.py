@@ -60,7 +60,7 @@ MODEL_PATH = str(REPO_ROOT / "stockfish_949_fp16.pt")
 OPENING_BOOK_PATH = str(REPO_ROOT / "opening_book.pkl") if (REPO_ROOT / "opening_book.pkl").exists() else None
 
 # Early termination constants for value-based decision skipping
-VALUE_EARLY_TERMINATION_THRESHOLD = 0.70  # abs(value) above this → skip PUCT (aggressive for bullet)
+VALUE_EARLY_TERMINATION_THRESHOLD = 0.85  # abs(value) above this → skip PUCT (less aggressive for better accuracy)
 VALUE_EARLY_TERMINATION_MIN_PLY = 2       # allow earlier termination (was 4)
 
 # Debug flags - set to True only when debugging (significantly impacts performance)
@@ -180,7 +180,7 @@ if model is not None:
         engine = UciEngine(
             model,
             use_puct=True,
-            sims=40,  # Reduced from 120 for bullet/1-minute games (will be adjusted by time management)
+            sims=60,  # Increased from 40 for better accuracy (will be adjusted by time management)
             c_puct=0.5,  # Reduced from 0.55 to trust policy more, faster convergence
             device=device,
             opening_book_path=OPENING_BOOK_PATH,
@@ -392,23 +392,24 @@ def value_to_sims_scale(value: float) -> float:
     abs_value = abs(float(value))
     value_float = float(value)
     
-    # More aggressive scaling for losing positions - when losing, search less
+    # Less aggressive scaling for better accuracy - still reduce for clear positions but not as much
     if value_float < -0.3:  # Losing position
-        # For losing positions, be very aggressive: scale down more
+        # For losing positions, still reduce but less aggressively
         if abs_value >= 0.85:
-            scale = 0.10  # Very aggressive for clearly losing positions
+            scale = 0.25  # Less aggressive for clearly losing positions (was 0.10)
         elif abs_value >= 0.5:
-            scale = 0.20  # Aggressive for moderately losing positions
+            scale = 0.40  # Less aggressive for moderately losing positions (was 0.20)
         else:
-            scale = 0.35  # Still reduce for slightly losing positions (like -0.417)
+            scale = 0.55  # Less aggressive for slightly losing positions (was 0.35)
     elif abs_value >= 0.85:  # Very winning/losing (but winning)
-        scale = 0.15  # Very aggressive for clearly winning positions
+        scale = 0.30  # Less aggressive for clearly winning positions (was 0.15)
     else:
-        # Linear mapping: abs_value 0.0 → scale 1.0, abs_value 0.85 → scale ~0.065 (bullet: shrink harder)
-        scale = 1.0 - 1.1 * abs_value
+        # Linear mapping: abs_value 0.0 → scale 1.0, abs_value 0.85 → scale ~0.30
+        # Less aggressive than before for better accuracy
+        scale = 1.0 - 0.8 * abs_value
     
-    # Clamp to [0.15, 1.0] to ensure reasonable bounds
-    return max(0.15, min(1.0, scale))
+    # Clamp to [0.25, 1.0] to ensure reasonable bounds (raised minimum from 0.15)
+    return max(0.25, min(1.0, scale))
 
 
 def format_value_eval(value: float) -> str:
@@ -988,15 +989,15 @@ def test_func(ctx: GameContext):
         value_float = float(value)
         abs_value = abs(float(value))
         
-        # More aggressive minimums for losing/winning positions (bullet-optimized)
+        # Increased minimums for better accuracy while still being time-efficient
         if abs_value >= 0.85:
-            min_sims = 4  # Very winning/losing - minimal search (reduced from 8 for bullet)
+            min_sims = 8  # Very winning/losing - minimal but reasonable search (increased from 4)
         elif value_float < -0.3:  # Losing position
-            min_sims = 4  # Losing - very minimal search (reduced from 8 for bullet)
+            min_sims = 8  # Losing - minimal but reasonable search (increased from 4)
         elif abs_value >= 0.5:
-            min_sims = 6  # Moderately winning/losing (reduced from 10 for bullet)
+            min_sims = 12  # Moderately winning/losing (increased from 6)
         else:
-            min_sims = 8  # Unclear positions (reduced from 12 for bullet)
+            min_sims = 15  # Unclear positions - need more search for accuracy (increased from 8)
         
         sims = max(min_sims, int(sims * scale))
         if VERBOSE:
@@ -1040,11 +1041,13 @@ def test_func(ctx: GameContext):
                     print(f"Decision mode: {decision_mode} (opening, ply {current_ply})")
                     print(f"Using tactical move: {move.uci()}")
                 # Track position after move
-                test_board = ctx.board.copy()
-                test_board.push(tactical_move)
-                engine._recent_positions.append(test_board.fen())
-                if len(engine._recent_positions) > 10:
-                    engine._recent_positions.pop(0)
+                ctx.board.push(tactical_move)
+                try:
+                    engine._recent_positions.append(ctx.board.fen())
+                    if len(engine._recent_positions) > 10:
+                        engine._recent_positions.pop(0)
+                finally:
+                    ctx.board.pop()
                 return move
         
         # Check opening book (if in opening phase and no tactical opportunity found)
@@ -1063,11 +1066,13 @@ def test_func(ctx: GameContext):
                 move_probs = {move: 1.0}
                 
                 # Track position after move
-                test_board = ctx.board.copy()
-                test_board.push(mv)
-                engine._recent_positions.append(test_board.fen())
-                if len(engine._recent_positions) > 10:
-                    engine._recent_positions.pop(0)
+                ctx.board.push(mv)
+                try:
+                    engine._recent_positions.append(ctx.board.fen())
+                    if len(engine._recent_positions) > 10:
+                        engine._recent_positions.pop(0)
+                finally:
+                    ctx.board.pop()
                 
                 ctx.logProbabilities(move_probs)
                 # Print move time if debug is enabled
@@ -1104,14 +1109,17 @@ def test_func(ctx: GameContext):
                         temperature=0.0,
                         use_dirichlet_noise=False,
                     )
+                    # Push move, copy board in new position, then pop
+                    ctx.board.push(mv)
                     test_board_book = ctx.board.copy()
-                    test_board_book.push(mv)
+                    ctx.board.pop()
                     temp_tree_book = SearchTree(test_board_book, engine.model, quick_config)
                     _, _, value_book_raw = temp_tree_book.search()
                     value_book = -value_book_raw  # Negate: opponent's perspective -> ours
                     
+                    ctx.board.push(top_model_move)
                     test_board_model = ctx.board.copy()
-                    test_board_model.push(top_model_move)
+                    ctx.board.pop()
                     temp_tree_model = SearchTree(test_board_model, engine.model, quick_config)
                     _, _, value_model_raw = temp_tree_model.search()
                     value_model = -value_model_raw  # Negate: opponent's perspective -> ours
@@ -1125,11 +1133,13 @@ def test_func(ctx: GameContext):
                             print(f"Decision mode: {decision_mode} (opening, ply {current_ply})")
                             print(f"Model confident ({top_model_prob*100:.1f}%) in {top_model_move.uci()} (value {value_model:.3f}), overriding opening book {mv.uci()} (value {value_book:.3f})")
                         # Track position after move
-                        test_board = ctx.board.copy()
-                        test_board.push(move)
-                        engine._recent_positions.append(test_board.fen())
-                        if len(engine._recent_positions) > 10:
-                            engine._recent_positions.pop(0)
+                        ctx.board.push(move)
+                        try:
+                            engine._recent_positions.append(ctx.board.fen())
+                            if len(engine._recent_positions) > 10:
+                                engine._recent_positions.pop(0)
+                        finally:
+                            ctx.board.pop()
                         return move
                 elif top_model_prob > 0.5:
                     # Very high confidence, use it even without PUCT
@@ -1139,11 +1149,13 @@ def test_func(ctx: GameContext):
                         print(f"Decision mode: {decision_mode} (opening, ply {current_ply})")
                         print(f"Model very confident ({top_model_prob*100:.1f}%) in {top_model_move.uci()}, overriding opening book {mv.uci()}")
                     # Track position after move
-                    test_board = ctx.board.copy()
-                    test_board.push(move)
-                    engine._recent_positions.append(test_board.fen())
-                    if len(engine._recent_positions) > 10:
-                        engine._recent_positions.pop(0)
+                    ctx.board.push(move)
+                    try:
+                        engine._recent_positions.append(ctx.board.fen())
+                        if len(engine._recent_positions) > 10:
+                            engine._recent_positions.pop(0)
+                    finally:
+                        ctx.board.pop()
                     return move
             
             # If we have MCTS available, do a quick search to see if there's a better move
@@ -1167,14 +1179,17 @@ def test_func(ctx: GameContext):
                     # Compare values: get evaluation for both moves
                     # After pushing a move, the board's turn flips, so we need to negate the value
                     # to get it from our perspective
+                    # Push move, copy board in new position, then pop
+                    ctx.board.push(mv)
                     test_board_book = ctx.board.copy()
-                    test_board_book.push(mv)
+                    ctx.board.pop()
                     temp_tree_book = SearchTree(test_board_book, engine.model, quick_config)
                     _, _, value_book_raw = temp_tree_book.search()
                     value_book = -value_book_raw  # Negate: opponent's perspective -> ours
                     
+                    ctx.board.push(search_move)
                     test_board_search = ctx.board.copy()
-                    test_board_search.push(search_move)
+                    ctx.board.pop()
                     temp_tree_search = SearchTree(test_board_search, engine.model, quick_config)
                     _, _, value_search_raw = temp_tree_search.search()
                     value_search = -value_search_raw  # Negate: opponent's perspective -> ours
@@ -1210,11 +1225,13 @@ def test_func(ctx: GameContext):
             
             move = mv
             # Track position after opening move
-            test_board = ctx.board.copy()
-            test_board.push(move)
-            engine._recent_positions.append(test_board.fen())
-            if len(engine._recent_positions) > 10:
-                engine._recent_positions.pop(0)
+            ctx.board.push(move)
+            try:
+                engine._recent_positions.append(ctx.board.fen())
+                if len(engine._recent_positions) > 10:
+                    engine._recent_positions.pop(0)
+            finally:
+                ctx.board.pop()
             return move
         
         # Use model/MCTS for non-opening positions
@@ -1387,12 +1404,12 @@ def test_func(ctx: GameContext):
                 mcts_policy_prob = move_probs.get(mv, 0.0) if move_probs else 0.0
                 top_policy_prob = move_probs.get(policy_move, 0.0) if move_probs else 0.0
                 
-                # TUNE: Optimized for 1-min games - more aggressive override
-                # Current thresholds: top > 12%, MCTS < 6%, top is 2.5x higher
-                # More aggressive than before to catch blunders faster in quick games
-                # Make even more aggressive: top > 0.10, MCTS < 0.08, multiplier > 2.0
-                # Make less aggressive: top > 0.20, MCTS < 0.04, multiplier > 4.0
-                if top_policy_prob > 0.12 and mcts_policy_prob < 0.06 and top_policy_prob > mcts_policy_prob * 2.5:
+                # TUNE: Optimized for accuracy - more aggressive override to catch blunders
+                # Current thresholds: top > 10%, MCTS < 8%, top is 2.0x higher
+                # More aggressive to catch blunders where MCTS chooses a bad move
+                # Make even more aggressive: top > 0.08, MCTS < 0.10, multiplier > 1.8
+                # Make less aggressive: top > 0.15, MCTS < 0.05, multiplier > 3.0
+                if top_policy_prob > 0.10 and mcts_policy_prob < 0.08 and top_policy_prob > mcts_policy_prob * 2.0:
                     # Calculate ratio safely (avoid division by zero)
                     if mcts_policy_prob > 0:
                         ratio = top_policy_prob / mcts_policy_prob
@@ -1408,14 +1425,16 @@ def test_func(ctx: GameContext):
             
             # If move would lead to a position we've seen recently, try to avoid it
             if mv is not None:
-                test_board = ctx.board.copy()
-                test_board.push(mv)
-                test_fen = test_board.fen()
-                # If this position appeared in last 3 moves, try a different move
-                if test_fen in engine._recent_positions[-3:]:
-                    print("Warning: Best move leads to recent repetition, re-searching with more sims...")
-                    # Re-search with more simulations to potentially get different move
-                    mv, _, _ = engine.search_tree.search(max_simulations_override=sims * 2)
+                ctx.board.push(mv)
+                try:
+                    test_fen = ctx.board.fen()
+                    # If this position appeared in last 3 moves, try a different move
+                    if test_fen in engine._recent_positions[-3:]:
+                        print("Warning: Best move leads to recent repetition, re-searching with more sims...")
+                        # Re-search with more simulations to potentially get different move
+                        mv, _, _ = engine.search_tree.search(max_simulations_override=sims * 2)
+                finally:
+                    ctx.board.pop()
             
             # Log root value prediction (from current player's perspective)
             if VERBOSE and hasattr(engine.search_tree, 'root') and engine.search_tree.root.visit_count > 0:
@@ -1521,12 +1540,14 @@ def test_func(ctx: GameContext):
         
         # Track position after move to detect repetition
         if move is not None:
-            test_board = ctx.board.copy()
-            test_board.push(move)
-            engine._recent_positions.append(test_board.fen())
-            # Keep only last 10 positions
-            if len(engine._recent_positions) > 10:
-                engine._recent_positions.pop(0)
+            ctx.board.push(move)
+            try:
+                engine._recent_positions.append(ctx.board.fen())
+                # Keep only last 10 positions
+                if len(engine._recent_positions) > 10:
+                    engine._recent_positions.pop(0)
+            finally:
+                ctx.board.pop()
         
         # Final logging
         if VERBOSE:
