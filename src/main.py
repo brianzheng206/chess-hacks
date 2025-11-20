@@ -56,13 +56,13 @@ import torch
 import pathlib
 REPO_ROOT = pathlib.Path(__file__).parent.parent
 # Use stockfish_949.pt from local repository
-MODEL_PATH = str(REPO_ROOT / "stockfish_949_fp16.pt")
+MODEL_PATH = str(REPO_ROOT / "distilled_rolling.pt")
 # Opening book enabled
 OPENING_BOOK_PATH = str(REPO_ROOT / "opening_book.pkl") if (REPO_ROOT / "opening_book.pkl").exists() else None
 
-# Early termination constants for value-based decision skipping - OPTIMIZED FOR SPEED
-VALUE_EARLY_TERMINATION_THRESHOLD = 0.70  # abs(value) above this → skip PUCT (lowered from 0.85 for speed)
-VALUE_EARLY_TERMINATION_MIN_PLY = 1       # allow earlier termination (reduced from 2 for speed)
+# Early termination constants - BALANCED TO PREVENT BLUNDERS
+VALUE_EARLY_TERMINATION_THRESHOLD = 0.80  # abs(value) above this → skip PUCT (increased from 0.70 to prevent blunders)
+VALUE_EARLY_TERMINATION_MIN_PLY = 2       # allow earlier termination (increased from 1 for safety)
 
 # Policy confidence skip: if enabled, skip MCTS when policy is very confident
 # Currently disabled for accuracy - with ~50 sims budget, the extra search is worth it
@@ -188,7 +188,7 @@ if model is not None:
         engine = UciEngine(
             model,
             use_puct=True,
-            sims=40,  # Reduced from 60 for speed (will be adjusted by time management)
+            sims=80,  # Increased from 40 for more search depth (will be adjusted by time management)
             c_puct=0.4,  # Reduced from 0.5 to trust policy more, faster convergence (speed optimized)
             device=device,
             opening_book_path=OPENING_BOOK_PATH,
@@ -1102,103 +1102,103 @@ def test_func(ctx: GameContext):
         moves_remaining_estimate = max(8, int(movetime_ms / 1200))  # Slightly more conservative
         time_per_move_ms = movetime_ms / max(moves_remaining_estimate, 1)
         
-        # Adaptive simulation rate - OPTIMIZED FOR SPEED (reduced rates)
+        # Adaptive simulation rate - INCREASED FOR MORE SEARCH
         if time_per_move_ms > 2500:  # >2.5 seconds per move: can search more
-            sims_per_sec = 100  # Reduced from 120 for speed
+            sims_per_sec = 150  # Increased from 100 for more search
         elif time_per_move_ms > 1200:  # 1.2-2.5 seconds: moderate search
-            sims_per_sec = 80  # Reduced from 100 for speed
+            sims_per_sec = 120  # Increased from 80 for more search
         elif time_per_move_ms > 600:  # 0.6-1.2 seconds: fast search
-            sims_per_sec = 65  # Reduced from 80 for speed
+            sims_per_sec = 100  # Increased from 65 for more search
         elif time_per_move_ms > 300:  # 0.3-0.6 seconds: very fast
-            sims_per_sec = 50  # Reduced from 65 for speed
+            sims_per_sec = 80  # Increased from 50 for more search
         else:  # <0.3 seconds: critical, minimal search
-            sims_per_sec = 35  # Reduced from 45 for speed
+            sims_per_sec = 60  # Increased from 35 for more search
         
-        # Use more aggressive time budget for speed - OPTIMIZED FOR SPEED
-        # Use only 50% of estimated time per move to ensure fast moves
-        time_budget_ms = time_per_move_ms * 0.50  # Reduced from 0.75 for speed
-        estimated_sims = max(10, int(time_budget_ms * sims_per_sec / 1000.0))  # Reduced min from 15 to 10
+        # Use more time budget for deeper search
+        # Use 60% of estimated time per move for more search depth
+        time_budget_ms = time_per_move_ms * 0.60  # Increased from 0.50 for more search
+        estimated_sims = max(15, int(time_budget_ms * sims_per_sec / 1000.0))  # Increased min from 10 to 15
         
-        # Cap simulations based on time remaining - FURTHER OPTIMIZED FOR SPEED
+        # Cap simulations based on time remaining - INCREASED FOR MORE SEARCH
         if movetime_ms > 40000:  # >40 seconds left (early game)
-            max_sims = 35  # Reduced from 45 for speed
+            max_sims = 70  # Increased from 35 for more search
         elif movetime_ms > 25000:  # 25-40 seconds
-            max_sims = 28  # Reduced from 35 for speed
+            max_sims = 60  # Increased from 28 for more search
         elif movetime_ms > 15000:  # 15-25 seconds
-            max_sims = 22  # Reduced from 28 for speed
+            max_sims = 50  # Increased from 22 for more search
         elif movetime_ms > 8000:  # 8-15 seconds
-            max_sims = 18  # Reduced from 22 for speed
+            max_sims = 40  # Increased from 18 for more search
         elif movetime_ms > 4000:  # 4-8 seconds
-            max_sims = 14  # Reduced from 16 for speed
+            max_sims = 30  # Increased from 14 for more search
         elif movetime_ms > 2000:  # 2-4 seconds
-            max_sims = 10  # Reduced from 12 for speed
+            max_sims = 20  # Increased from 10 for more search
         else:  # <2 seconds: critical time
-            max_sims = 6  # Reduced from 8 for speed
+            max_sims = 12  # Increased from 6 for more search
         
         sims = min(estimated_sims, max_sims)
         
-        # Additional time pressure handling - FURTHER OPTIMIZED FOR SPEED
+        # Additional time pressure handling - INCREASED FOR MORE SEARCH
         if movetime_ms < 15000:  # Less than 15 seconds
-            sims = min(sims, 25)  # Reduced from 30 for speed
+            sims = min(sims, 50)  # Increased from 25 for more search
         if movetime_ms < 8000:  # Less than 8 seconds
-            sims = min(sims, 18)  # Reduced from 22 for speed
+            sims = min(sims, 40)  # Increased from 18 for more search
         if movetime_ms < 4000:  # Less than 4 seconds
-            sims = min(sims, 12)  # Reduced from 16 for speed
+            sims = min(sims, 30)  # Increased from 12 for more search
         if movetime_ms < 2000:  # Less than 2 seconds
-            sims = min(sims, 8)  # Reduced from 10 for speed
+            sims = min(sims, 20)  # Increased from 8 for more search
         
-        # Absolute global cap - FURTHER OPTIMIZED FOR SPEED
-        sims = min(sims, 32)  # Reduced from 40 for speed
+        # Absolute global cap - INCREASED FOR MORE SEARCH
+        sims = min(sims, 80)  # Increased from 32 for more search
     else:
-        # No time info available - use conservative defaults - OPTIMIZED FOR SPEED
-        sims = min(sims, 35)  # Reduced from 50 for speed
+        # No time info available - use conservative defaults - INCREASED FOR MORE SEARCH
+        sims = min(sims, 70)  # Increased from 35 for more search
     
-    # Phase-aware adjustments - OPTIMIZED FOR SPEED
-    # Strategy: Trust policy more, reduce search in all phases for faster moves
+    # Phase-aware adjustments - INCREASED FOR MORE SEARCH
+    # Strategy: Allow more search in all phases for better play
     if game_phase > 0.7:  # Opening
-        sims = min(sims, 30)  # Reduced from 40 for speed
+        sims = min(sims, 60)  # Increased from 30 for more search
         if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
             engine.mcts_config.c_puct = 0.35  # Reduced from 0.8 - trust policy more for speed
     elif game_phase < 0.3:  # Endgame
-        # In endgame, be very efficient - trust policy heavily
+        # In endgame, allow more search
         if movetime_ms > 0:
             if movetime_ms < 8000:  # Less than 8 seconds: time pressure
-                sims = min(sims, 25)  # Reduced from 40 for speed
+                sims = min(sims, 50)  # Increased from 25 for more search
                 if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
                     engine.mcts_config.c_puct = 0.35  # Trust policy very heavily for speed
             elif movetime_ms < 15000:  # 8-15 seconds: moderate time
-                sims = min(sims, 35)  # Reduced from 50 for speed
+                sims = min(sims, 70)  # Increased from 35 for more search
                 if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
                     engine.mcts_config.c_puct = 0.35  # Trust policy more for speed
             else:  # >15 seconds: can search more
-                sims = min(sims, 40)  # Reduced from 60 for speed
+                sims = min(sims, 80)  # Increased from 40 for more search
                 if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
                     engine.mcts_config.c_puct = 0.35  # Trust policy more for speed
         else:
             # No time info - use safe defaults for endgame
-            sims = min(sims, 35)  # Reduced from 50 for speed
+            sims = min(sims, 70)  # Increased from 35 for more search
             if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
                 engine.mcts_config.c_puct = 0.35
-    else:  # Midgame - prioritize speed (AGGRESSIVE FOR PLY 10-14)
-        # Midgame: be very fast, trust policy more - FURTHER REDUCED FOR SPEED
+    else:  # Midgame - BALANCE SPEED AND ACCURACY (prevent blunders)
+        # Midgame: need more search to avoid blunders, but still be reasonably fast
         if movetime_ms > 0:
-            if movetime_ms > 30000:  # Plenty of time: still prioritize speed
-                sims = min(sims, 35)  # Reduced from 50 for speed (middlegame optimization)
+            if movetime_ms > 30000:  # Plenty of time: can search more
+                sims = min(sims, 55)  # Balanced: enough search to avoid blunders
                 if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
-                    engine.mcts_config.c_puct = 0.30  # Reduced from 0.35 - trust policy even more
-            elif movetime_ms > 15000:  # Moderate time: be fast
-                sims = min(sims, 28)  # Reduced from 40 for speed (middlegame optimization)
+                    engine.mcts_config.c_puct = 0.45  # Increased from 0.30 - more exploration to find tactics
+            elif movetime_ms > 15000:  # Moderate time: need good search
+                sims = min(sims, 45)  # Balanced: enough search to avoid blunders
                 if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
-                    engine.mcts_config.c_puct = 0.30  # Reduced from 0.35 - trust policy even more
-            else:  # Time pressure: minimal search
-                sims = min(sims, 22)  # Reduced from 30 for speed (middlegame optimization)
+                    engine.mcts_config.c_puct = 0.45  # Increased from 0.30 - more exploration
+            else:  # Time pressure: still need minimum search to avoid blunders
+                sims = min(sims, 35)  # Minimum search to avoid major blunders
                 if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
-                    engine.mcts_config.c_puct = 0.30  # Reduced from 0.35 - trust policy heavily
+                    engine.mcts_config.c_puct = 0.40  # Increased from 0.30 - still need some exploration
         else:
-            # No time info - use safe defaults for midgame
-            sims = min(sims, 28)  # Reduced from 40 for speed (middlegame optimization)
+            # No time info - use safe defaults for midgame (prevent blunders)
+            sims = min(sims, 45)  # Safe default to avoid blunders
             if hasattr(engine, 'mcts_config') and engine.mcts_config is not None:
-                engine.mcts_config.c_puct = 0.30  # Reduced from 0.35
+                engine.mcts_config.c_puct = 0.45  # Increased from 0.30 - more exploration
     
     # ------------------------------
     # VALUE-AWARE SIMS SCALING
@@ -1213,23 +1213,23 @@ def test_func(ctx: GameContext):
         value_float = float(value)
         abs_value = abs(value_float)
         
-        # Reduced minimums for speed - OPTIMIZED FOR SPEED
+        # Increased minimums to prevent blunders - BALANCE SPEED AND ACCURACY
         if abs_value >= 0.85:
-            min_sims = 5  # Very winning/losing - minimal search for speed
+            min_sims = 12  # Very winning/losing - enough search to avoid blunders
         elif value_float < -0.3:  # Losing position
-            min_sims = 5  # Losing - minimal search for speed
+            min_sims = 15  # Losing - need more search to find counterplay
         elif abs_value >= 0.5:
-            min_sims = 8  # Moderately winning/losing - reduced for speed
+            min_sims = 18  # Moderately winning/losing - need search to avoid blunders
         else:
-            min_sims = 12  # Unclear positions - reduced for speed
+            min_sims = 22  # Unclear positions - need good search to avoid tactical blunders
         
         sims = max(min_sims, int(sims * scale))
         if VERBOSE:
             print(f"Value-aware sims scaling: value={value_float:+.3f}, scale={scale:.2f}, sims {sims_before} → {sims}")
     elif value is not None and tactical_heavy:
-        # Reduced bump for tactical chaos - OPTIMIZED FOR SPEED
+        # Increased bump for tactical chaos - CRITICAL: need search to avoid tactical blunders
         sims_before = sims
-        sims = max(sims, 15)  # Reduced from 18 for speed
+        sims = max(sims, 35)  # Increased from 30 - more search for tactical positions to prevent blunders
         if VERBOSE and sims > sims_before:
             print(f"Tactical position: increased sims from {sims_before} to {sims} (tactical_heavy=True)")
     
